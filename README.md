@@ -21,7 +21,7 @@ Un orquestador inteligente que busca ofertas de trabajo en múltiples plataforma
 
 1.  **Clonar el repositorio:**
     ```bash
-    git clone https://github.com/tu-usuario/jobfinder.git
+    git clone https://github.com/markbus-ai/jobfinder.git
     cd jobfinder
     ```
 
