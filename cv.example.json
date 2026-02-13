@@ -1,0 +1,24 @@
+{
+  "name": "Juan Perez",
+  "role": "Python Backend Developer",
+  "summary": "Desarrollador Backend con 3 años de experiencia en Python y APIs REST.",
+  "skills": [
+    "Python",
+    "FastAPI",
+    "SQLModel",
+    "Docker",
+    "PostgreSQL",
+    "Git"
+  ],
+  "experience": [
+    {
+      "title": "Backend Developer",
+      "company": "Tech Solutions",
+      "description": "Desarrollo de microservicios y optimización de bases de datos."
+    }
+  ],
+  "languages": [
+    "Español (Nativo)",
+    "Inglés (B1)"
+  ]
+}

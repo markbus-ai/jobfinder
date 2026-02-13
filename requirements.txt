@@ -1,0 +1,7 @@
+python-jobspy
+python-telegram-bot
+sqlmodel
+groq
+instructor
+python-dotenv
+pandas
