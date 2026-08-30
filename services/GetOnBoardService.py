@@ -74,14 +74,31 @@ class GetOnBoardService:
             # Remote flag
             is_remote = bool(attrs.get("remote", False))
 
-            # Seniority
-            seniority = attrs.get("seniority", None)
+            # Seniority - may be nested dict like {'data': {'id': 4, 'type': 'seniority'}}
+            seniority_raw = attrs.get("seniority", None)
+            if isinstance(seniority_raw, dict):
+                seniority_data = seniority_raw.get("data", {})
+                seniority = seniority_data.get("type", None)
+            else:
+                seniority = str(seniority_raw) if seniority_raw else None
 
-            # Modality
-            modality = attrs.get("modality", None)
+            # Modality - may be nested dict like {'data': {'id': 1, 'type': 'modality'}}
+            modality_raw = attrs.get("modality", None)
+            if isinstance(modality_raw, dict):
+                modality_data = modality_raw.get("data", {})
+                modality = modality_data.get("type", None)
+            else:
+                modality = str(modality_raw) if modality_raw else None
 
-            # Skill tags
-            tags = attrs.get("tags", []) or []
+            # Skill tags - may be nested dict like {'data': [{'id': 6741, 'type': 'tag'}]}
+            tags_raw = attrs.get("tags", []) or []
+            if isinstance(tags_raw, dict):
+                tags_list = tags_raw.get("data", [])
+                tags = [t.get("name", t.get("type", "")) for t in tags_list if isinstance(t, dict)]
+            elif isinstance(tags_raw, list):
+                tags = [t.get("name", t) if isinstance(t, dict) else str(t) for t in tags_raw]
+            else:
+                tags = []
             tags_str = json.dumps(tags) if tags else None
 
             job = Job(
