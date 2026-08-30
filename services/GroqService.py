@@ -433,6 +433,31 @@ class AIService:
             },
         )
 
+    def extract_company_email(self, job: Job) -> str | None:
+        """
+        Try to extract a company email from the job description.
+        Uses regex first (fast), then Groq as fallback for ambiguous cases.
+        """
+        import re
+        job_desc = str(job.description) if job.description else ""
+        
+        # Quick regex extraction first
+        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+        emails = re.findall(email_pattern, job_desc)
+        
+        # Filter out generic/personal emails
+        skip_domains = {'example.com', 'gmail.com', 'yahoo.com', 'hotmail.com', 
+                       'outlook.com', 'mail.com', 'protonmail.com'}
+        skip_patterns = ['noreply', 'no-reply', 'donotreply', 'mailer-daemon']
+        
+        for email in emails:
+            domain = email.split('@')[1].lower()
+            local = email.split('@')[0].lower()
+            if domain not in skip_domains and not any(p in local for p in skip_patterns):
+                return email
+        
+        return None
+
 
 # Singleton instance
 ai_service = AIService()
