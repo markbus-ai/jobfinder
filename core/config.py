@@ -24,8 +24,8 @@ class Settings(BaseModel):
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # Search configuration
-    SEARCH_TERMS: str = os.getenv("SEARCH_TERMS", "python developer,fastapi developer,backend developer,react developer,frontend developer,ai engineer,llm developer")
-    SEARCH_SOURCES: str = os.getenv("SEARCH_SOURCES", "getonboard,linkedin,indeed,google")
+    SEARCH_TERMS: str = os.getenv("SEARCH_TERMS", "python developer,backend developer,react developer,ai engineer")
+    SEARCH_SOURCES: str = os.getenv("SEARCH_SOURCES", "getonboard,linkedin")
 
     # GetOnBoard configuration
     GETONBOARD_ENABLED: bool = os.getenv("GETONBOARD_ENABLED", "true").lower() == "true"
