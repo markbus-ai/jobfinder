@@ -220,29 +220,69 @@ class AIService:
         self._key_index = 0
         self.model = model
         self.client = self._make_client()
+        
+        # Rate limit tracking per key: {key_index: [timestamps]}
+        import time
+        self._time = time
+        self._request_times: Dict[int, list] = {i: [] for i in range(len(self._keys))}
+        self._MIN_DELAY = 0.5  # Min seconds between requests per key
+        self._MAX_RPM_PER_KEY = 28  # Stay under 30 RPM limit
 
     def _make_client(self):
         key = self._keys[self._key_index % len(self._keys)]
         return instructor.from_groq(Groq(api_key=key), mode=instructor.Mode.JSON)
 
     def _rotate_key(self):
-        """Rotate to next API key on failure."""
+        """Rotate to next API key with cooldown tracking."""
         if len(self._keys) > 1:
-            self._key_index = (self._key_index + 1) % len(self._keys)
-            self.client = self._make_client()
-            logging.getLogger(__name__).info(f"🔄 Rotated to Groq key #{self._key_index + 1}")
+            # Clean old timestamps (older than 60s)
+            now = self._time.time()
+            for idx in self._request_times:
+                self._request_times[idx] = [t for t in self._request_times[idx] if now - t < 60]
+            
+            # Find key with fewest recent requests
+            best_idx = min(range(len(self._keys)), key=lambda i: len(self._request_times[i]))
+            if best_idx != self._key_index:
+                self._key_index = best_idx
+                self.client = self._make_client()
+                logging.getLogger(__name__).info(f"🔄 Rotated to Groq key #{self._key_index + 1} ({len(self._request_times[self._key_index])} req/min)")
+
+    def _check_rate_limit(self):
+        """Wait if current key is near rate limit."""
+        now = self._time.time()
+        idx = self._key_index
+        # Clean old timestamps
+        self._request_times[idx] = [t for t in self._request_times[idx] if now - t < 60]
+        
+        if len(self._request_times[idx]) >= self._MAX_RPM_PER_KEY:
+            # Key exhausted, rotate
+            logging.getLogger(__name__).warning(f"⚠️ Key #{idx + 1} at {self._MAX_RPM_PER_KEY} RPM, rotating...")
+            self._rotate_key()
+            return True
+        return False
+
+    def _record_request(self):
+        """Record request timestamp for rate limiting."""
+        now = self._time.time()
+        self._request_times[self._key_index].append(now)
+        # Auto-rotate if approaching limit
+        if len(self._request_times[self._key_index]) >= self._MAX_RPM_PER_KEY - 2:
+            self._rotate_key()
 
     def analyze_job(self, job: Job, cv_data: Dict[str, Any]) -> JobAudit:
         """
         Analyze a job listing against a candidate profile (CV) for objective compatibility.
         Uses structured metadata when available to improve analysis accuracy.
-        Rotates API keys on failure.
+        Rotates API keys on failure and respects rate limits.
         """
-        max_retries = len(self._keys)
+        max_retries = len(self._keys) * 2  # Try each key up to 2 times
         last_error = None
         
         for attempt in range(max_retries):
             try:
+                # Check rate limit before making request
+                self._check_rate_limit()
+                self._record_request()
                 # Ensure string (pandas may return float NaN)
                 job_desc = str(job.description) if job.description is not None else "No description available"
 
@@ -330,18 +370,17 @@ class AIService:
     def generate_cv_content(self, job: Job, audit: JobAudit) -> CVContent:
         """
         Generate customized CV content for a specific job using Groq.
-
-        Takes the job + audit results and returns structured data that the CVGenerator
-        uses to reorder/rephrase sections in the Typst template.
-
-        CRITICAL: Only reorders and re-emphasizes REAL content. Never fabricates.
-        Rotates API keys on failure.
+        Rotates API keys on failure and respects rate limits.
         """
-        max_retries = len(self._keys)
+        max_retries = len(self._keys) * 2  # Try each key up to 2 times
         last_error = None
         
         for attempt in range(max_retries):
             try:
+                # Check rate limit before making request
+                self._check_rate_limit()
+                self._record_request()
+                
                 job_desc = str(job.description) if job.description is not None else "No description available"
 
                 profile_json = json.dumps(CANDIDATE_PROFILE, ensure_ascii=False, indent=2)

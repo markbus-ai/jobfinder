@@ -103,8 +103,11 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
 
             logger.info(f"🤖 Analyzing: {job.title} @ {job.company}")
 
-            # AI analysis
+            # AI analysis (with rate limiting)
             audit = ai_service.analyze_job(job, {})
+            
+            # Small delay between API calls to respect rate limits
+            time.sleep(0.5)
 
             # Detailed logging
             logger.info(f"📊 Analysis for {job.company} - {job.title}:")
@@ -133,6 +136,7 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                 # 1. Generate customized CV content via Groq
                 try:
                     cv_content = ai_service.generate_cv_content(job, audit)
+                    time.sleep(0.5)  # Rate limit delay
                     logger.info(f"   📝 CV content generated: objective={len(cv_content.objetivo)} chars, "
                               f"skills_order={len(cv_content.skills_order)} items, "
                               f"experience_order={cv_content.experience_order}")
