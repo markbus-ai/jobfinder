@@ -1,6 +1,6 @@
 import asyncio
-import json
 from typing import Optional
+
 
 class MemoryQueue:
     def __init__(self):
@@ -13,5 +13,4 @@ class MemoryQueue:
 
     async def dequeue(self) -> Optional[dict]:
         """Saca un mensaje de la cola (blocking get)."""
-        # get() bloquea de forma asíncrona hasta que haya un item
         return await self.queue.get()

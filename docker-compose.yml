@@ -1,0 +1,20 @@
+services:
+  jobfinder:
+    build: .
+    container_name: jobfinder
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Typst templates (host -> container)
+      - ${CV_TEMPLATES_DIR:-~/.config/cvs}:/root/.config/cvs:ro
+      # SQLite database persistence
+      - jobfinder-data:/app/data
+      # Generated CVs
+      - jobfinder-cvs:/tmp/jobfinder_cvs
+    environment:
+      - DATABASE_URL=sqlite:///app/data/jobfinder.db
+      - CV_OUTPUT_DIR=/tmp/jobfinder_cvs
+
+volumes:
+  jobfinder-data:
+  jobfinder-cvs:

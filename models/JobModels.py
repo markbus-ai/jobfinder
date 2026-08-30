@@ -1,6 +1,7 @@
-from datetime import datetime, date
-from typing import Optional, List
-from sqlmodel import SQLModel, Field, JSON
+from datetime import datetime
+from typing import Optional
+from sqlmodel import SQLModel, Field
+
 
 class Job(SQLModel, table=True):
     id: str = Field(primary_key=True)
@@ -14,19 +15,22 @@ class Job(SQLModel, table=True):
     salary: Optional[str] = Field(default=None)
     is_remote: bool = Field(default=False)
 
-    # --- Capa de Inteligencia ---
+    # --- Source Platform Metadata ---
+    seniority: Optional[str] = Field(default=None)
+    modality: Optional[str] = Field(default=None)
+    tags: Optional[str] = Field(default=None)
+    source_platform: Optional[str] = Field(default=None)
+
+    # --- AI Analysis Layer ---
     ai_match_score: Optional[int] = Field(default=None)
     ai_summary: Optional[str] = Field(default=None)
-    is_junior: Optional[bool] = Field(default=None)
-    
-    # Nuevos campos de auditoría
+    recommended_profile: Optional[str] = Field(default=None)  # "backend" | "frontend" | "backend_ai"
     is_suitable: Optional[bool] = Field(default=None)
     seniority_mismatch: Optional[bool] = Field(default=None)
-    missing_skills: Optional[str] = Field(default=None)  # Guardaremos la lista como JSON string
+    missing_skills: Optional[str] = Field(default=None)  # JSON string list
 
+    # --- Pipeline Status ---
+    cv_generated: bool = Field(default=False)
+    cv_path: Optional[str] = Field(default=None)
+    email_sent: bool = Field(default=False)
     notified: bool = Field(default=False)
-
-class Message(SQLModel, table=True):
-    id: str = Field(primary_key=True)
-    text: str
-    date: date

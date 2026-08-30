@@ -2,7 +2,7 @@ import asyncio
 from sqlmodel import Session, select, func
 from database import engine
 from models.JobModels import Job
-from services.RedisServices import RedisQueue
+from services.RedisServices import MemoryQueue
 
 async def show_status():
     print("--- 📉 Ofertas con Score < 70 (Últimas 10) ---")

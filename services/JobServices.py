@@ -51,7 +51,7 @@ class JobService:
                 if not clean_url:
                     continue
 
-                # Mapeo exacto con JobModels.Job
+                # Map exact fields to JobModels.Job
                 job = Job(
                     id=clean_url,
                     title=str(row.get("title", "Sin Título")),
@@ -63,8 +63,7 @@ class JobService:
                     else "Sin descripción disponible",
                     salary=str(row.get("salary")) if row.get("salary") else None,
                     is_remote=bool(row.get("is_remote", False)),
-                    # Los campos de IA (score, summary, is_junior) y notified
-                    # usan sus valores por defecto definidos en el modelo.
+                    source_platform=str(row.get("site", "jobspy")),
                 )
                 internal_jobs.append(job)
 

@@ -1,0 +1,12 @@
+.git
+.atl
+__pycache__
+*.pyc
+.env
+.env.example
+.env.*
+debug_status.py
+README.md
+LICENSE
+*.db
+*.sqlite
