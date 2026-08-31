@@ -1,4 +1,5 @@
 import json
+import logging
 import instructor
 from groq import Groq
 from pydantic import BaseModel, Field
