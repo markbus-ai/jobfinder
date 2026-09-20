@@ -6,11 +6,12 @@ terms against on-site search. These tests lock in the remote plan and prove the
 flag reaches the scraper.
 """
 
+import logging
+
 import pytest
 
 from services import JobServices
 from services.SearchPlanner import (
-    MAX_REMOTE_SEARCHES,
     build_scrape_plan,
     country_token_for_location,
     parse_csv,
@@ -75,10 +76,42 @@ def test_remote_searches_are_issued_with_is_remote_true():
         ("Uruguay", "uruguay"),
         ("Chile", "chile"),
         ("Buenos Aires, Argentina", "argentina"),
+        ("Remote, Chile", "chile"),
     ],
 )
 def test_remote_country_token(location, expected):
     assert country_token_for_location(location) == expected
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["", "   ", "Buenos Aires", "Narnia", "Remote", "country_relevant"],
+)
+def test_unresolvable_remote_country_token_is_none(location):
+    # A bare city or unknown name must resolve to None, never raise.
+    assert country_token_for_location(location) is None
+
+
+def test_unresolvable_remote_location_is_skipped_with_warning(caplog):
+    caplog.set_level(logging.WARNING)
+    plan = _plan(remote_locations=["Buenos Aires", "Chile"])
+    remote = [search for search in plan if search.is_remote]
+
+    assert {(search.location, search.country) for search in remote} == {("Chile", "chile")}
+    assert "Buenos Aires" in caplog.text
+
+
+def test_comma_separated_locations_plan_only_the_valid_entries(caplog):
+    # W4 reproduction: "Buenos Aires, Argentina, Chile" splits into three entries;
+    # the bare city is skipped with a warning and the valid countries are planned.
+    caplog.set_level(logging.WARNING)
+    locations = parse_csv("Buenos Aires, Argentina, Chile")
+    assert locations == ["Buenos Aires", "Argentina", "Chile"]
+
+    plan = _plan(remote_locations=locations)
+    remote = [search for search in plan if search.is_remote]
+    assert {search.country for search in remote} == {"argentina", "chile"}
+    assert "Buenos Aires" in caplog.text
 
 
 def test_remote_search_disabled():
@@ -92,7 +125,9 @@ def test_remote_volume_is_bounded():
     many_terms = [f"termino remoto {i}" for i in range(20)]
     plan = _plan(remote_terms=many_terms)
     remote = [search for search in plan if search.is_remote]
-    assert len(remote) == MAX_REMOTE_SEARCHES
+    # Literal on purpose: asserting the imported constant would silently pass if
+    # the cap itself changed.
+    assert len(remote) == 12
 
 
 def test_plan_summary_counts_before_and_after():
@@ -142,6 +177,21 @@ def test_cycle_skips_remote_search_when_disabled(fresh_db, cycle_runner):
     assert not any(call.get("is_remote") for call in service.calls)
     # The cycle runner uses one term x six countries for the per-country search.
     assert len(service.calls) == 6
+
+
+def test_local_country_targets_are_literal(fresh_db, cycle_runner):
+    # G1: the local jobspy targets must stay exactly these country tokens. A
+    # mutation of 'argentina' to 'usa' must fail here.
+    service, _ = cycle_runner([], lambda *a, **k: None)
+    pairs = {(call["location"], call["country"]) for call in service.calls}
+    assert pairs == {
+        ("Argentina", "argentina"),
+        ("Spain", "spain"),
+        ("Mexico", "mexico"),
+        ("Colombia", "colombia"),
+        ("Chile", "chile"),
+        ("Uruguay", "uruguay"),
+    }
 
 
 def test_default_config_terms_and_locations():
