@@ -20,6 +20,7 @@ from services.CVGenerator import generate_cv, generate_custom_typst, classify_jo
 from services.EmailService import EmailService
 from services.LocationPolicy import classify_location, is_notifiable
 from services.AnalysisRetry import TransientAnalysisError, should_reanalyze
+from services.SearchPlanner import build_scrape_plan, parse_csv, summarize_plan
 
 # Logging configuration
 logging.basicConfig(
@@ -60,49 +61,64 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
     6. Saves results to DB
     7. Returns list of notifications
     """
-    search_terms = [t.strip() for t in settings.SEARCH_TERMS.split(",") if t.strip()]
+    search_terms = parse_csv(settings.SEARCH_TERMS)
+    remote_terms = parse_csv(settings.SEARCH_TERMS_REMOTE)
+    remote_locations = parse_csv(settings.REMOTE_SEARCH_LOCATIONS)
     sources = [s.strip().lower() for s in settings.SEARCH_SOURCES.split(",") if s.strip()]
 
-    logger.info("🔎 Starting job scraping...")
+    # JobSpy per-country targets. Each country token drives the Indeed domain.
+    search_locations = [
+        ("Argentina", "argentina"),
+        ("Spain", "spain"),
+        ("Mexico", "mexico"),
+        ("Colombia", "colombia"),
+        ("Chile", "chile"),
+        ("Uruguay", "uruguay"),
+    ]
+
+    plan = build_scrape_plan(
+        search_terms=search_terms,
+        sources=sources,
+        jobspy_locations=search_locations,
+        getonboard_enabled=settings.GETONBOARD_ENABLED,
+        remote_enabled=settings.REMOTE_SEARCH_ENABLED,
+        remote_terms=remote_terms,
+        remote_locations=remote_locations,
+    )
+    counts = summarize_plan(plan)
+    logger.info(
+        f"🔎 Starting job scraping: {counts['total']} searches this cycle "
+        f"(getonboard={counts['getonboard']}, jobspy={counts['jobspy']}, remote={counts['remote']})."
+    )
 
     all_jobs = []
 
-    # --- GetOnBoard (LATAM public API, no auth needed) ---
-    if settings.GETONBOARD_ENABLED and "getonboard" in sources:
-        for term in search_terms:
-            try:
-                logger.info(f"🌎 Searching '{term}' on GetOnBoard...")
-                gob_jobs = getonboard_service.get_latest_jobs(term=term)
-                all_jobs.extend(gob_jobs)
-            except Exception as e:
-                logger.error(f"❌ Error searching '{term}' on GetOnBoard: {e}")
-        time.sleep(2)
-
-    # --- JobSpy: LinkedIn, Indeed, Google (per-country) ---
-    jobspy_sources = [s for s in sources if s != "getonboard"]
-    if jobspy_sources:
-        search_locations = [
-            {"loc": "Argentina", "country": "argentina"},
-            {"loc": "Spain", "country": "spain"},
-            {"loc": "Mexico", "country": "mexico"},
-            {"loc": "Colombia", "country": "colombia"},
-            {"loc": "Chile", "country": "chile"},
-            {"loc": "Uruguay", "country": "uruguay"},
-        ]
-
-        for target in search_locations:
-            for term in search_terms:
-                try:
-                    logger.info(f"🔎 Searching '{term}' in {target['loc']}...")
-                    jobs = job_service.get_latest_jobs(
-                        term=term,
-                        location=target["loc"],
-                        country=target["country"],
-                        limit=15,
+    for index, search in enumerate(plan):
+        try:
+            if search.source == "getonboard":
+                logger.info(f"🌎 Searching '{search.term}' on GetOnBoard...")
+                all_jobs.extend(getonboard_service.get_latest_jobs(term=search.term))
+            else:
+                mode = "remote" if search.is_remote else "local"
+                logger.info(f"🔎 Searching '{search.term}' in {search.location} ({mode})...")
+                all_jobs.extend(
+                    job_service.get_latest_jobs(
+                        term=search.term,
+                        location=search.location,
+                        country=search.country,
+                        limit=search.limit,
+                        is_remote=search.is_remote,
                     )
-                    all_jobs.extend(jobs)
-                except Exception as e:
-                    logger.error(f"❌ Error searching in {target['loc']}: {e}")
+                )
+        except Exception as e:
+            logger.error(f"❌ Error searching '{search.term}' in {search.location or 'getonboard'}: {e}")
+
+        # Preserve the original pacing: brief pause between source/location groups.
+        next_search = plan[index + 1] if index + 1 < len(plan) else None
+        if next_search is not None and (
+            next_search.source != search.source
+            or (search.source == "jobspy" and next_search.location != search.location)
+        ):
             time.sleep(2)
 
     # Deduplicate by ID (URL)

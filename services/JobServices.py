@@ -22,7 +22,8 @@ class JobService:
         term: str = "python developer", 
         location: str = "Argentina",
         country: str = "argentina",
-        limit: int = 15
+        limit: int = 15,
+        is_remote: bool = False,
     ) -> List[Job]:
         """
         Consume JobSpy and mapea los resultados a nuestro modelo de SQLModel Job.
@@ -38,6 +39,7 @@ class JobService:
                 results_wanted=limit,
                 hours_old=24,
                 country_indeed=country,
+                is_remote=is_remote,
                 description_format="markdown",
             )
             if jobs_df is None or jobs_df.empty:

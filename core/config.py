@@ -35,6 +35,14 @@ class Settings(BaseModel):
     SEARCH_TERMS: str = os.getenv("SEARCH_TERMS", "python developer,backend developer,fastapi developer,fullstack developer,ai engineer")
     SEARCH_SOURCES: str = os.getenv("SEARCH_SOURCES", "getonboard,linkedin")
 
+    # Remote (Spanish-language) search for LATAM
+    REMOTE_SEARCH_ENABLED: bool = env_bool("REMOTE_SEARCH_ENABLED", True)
+    SEARCH_TERMS_REMOTE: str = os.getenv(
+        "SEARCH_TERMS_REMOTE",
+        "desarrollador backend remoto,desarrollador python remoto,desarrollador fullstack remoto",
+    )
+    REMOTE_SEARCH_LOCATIONS: str = os.getenv("REMOTE_SEARCH_LOCATIONS", "Argentina,Uruguay,Chile")
+
     # GetOnBoard configuration
     GETONBOARD_ENABLED: bool = os.getenv("GETONBOARD_ENABLED", "true").lower() == "true"
     GETONBOARD_PER_PAGE: int = int(os.getenv("GETONBOARD_PER_PAGE", "50"))
