@@ -43,10 +43,20 @@ logger = logging.getLogger(__name__)
 # Key: job_id, Value: dict with company, email, cv_path, profile
 jobs_with_email: Dict[str, Dict[str, Any]] = {}
 
-# Telegram display labels for the English level, keyed from the single-source
-# vocabulary so a level can never be added without a label.
-_ENGLISH_LEVEL_DISPLAY = ("No requerido", "Básico", "Intermedio", "Fluido")
-ENGLISH_LEVEL_LABELS = dict(zip(ENGLISH_LEVELS, _ENGLISH_LEVEL_DISPLAY))
+# Telegram display labels for the English level, keyed by the single-source
+# vocabulary. Completeness is asserted below, so adding a level without a label
+# fails at import time instead of silently dropping the label.
+_ENGLISH_LEVEL_DISPLAY: dict[str, str] = {
+    "none": "No requerido",
+    "basic": "Básico",
+    "intermediate": "Intermedio",
+    "fluent": "Fluido",
+}
+assert set(_ENGLISH_LEVEL_DISPLAY) == set(ENGLISH_LEVELS), (
+    "Every English level needs a Telegram display label; add the missing "
+    "level(s) to _ENGLISH_LEVEL_DISPLAY."
+)
+ENGLISH_LEVEL_LABELS = dict(_ENGLISH_LEVEL_DISPLAY)
 
 
 def _refresh_scraped_fields(target: Job, source: Job) -> Job:
@@ -121,6 +131,11 @@ def _release_english_withheld(
         return False
 
     job.notified = True
+    # UX note: this token-free release path always reports cv_generated from the
+    # stored row and no company email, so the message renders "CV: X | Sin email"
+    # with no Auto-postular button. That is intentional, not a bug: generating a CV
+    # or extracting an email here would cost one Groq request per released row,
+    # which is exactly what this path exists to avoid.
     notifications.append(
         _notification_payload(
             job,
