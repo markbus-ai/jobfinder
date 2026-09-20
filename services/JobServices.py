@@ -29,7 +29,7 @@ class JobService:
         Consume JobSpy and map the results to our SQLModel Job model.
         """
         try:
-            # Llamada a la librería JobSpy (envuelta en retry)
+            # JobSpy library call (wrapped in retry).
             # country_indeed drives the Indeed domain and the indeed-co header.
             # The old country_relevant kwarg was silently swallowed by jobspy.
             jobs_df = self._scrape_safe(
@@ -43,12 +43,12 @@ class JobService:
                 description_format="markdown",
             )
             if jobs_df is None or jobs_df.empty:
-                self.logger.info(f"No se encontraron ofertas en {location}.")
+                self.logger.info(f"No job offers found in {location}.")
                 return []
 
             internal_jobs = []
             for _, row in jobs_df.iterrows():
-                # El ID es la URL limpia
+                # The ID is the clean URL.
                 job_url = str(row.get("job_url", ""))
                 clean_url = job_url.split("?")[0] if job_url else None
 
