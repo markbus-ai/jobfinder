@@ -28,6 +28,17 @@ DEFAULT_BACKOFF_SECONDS = 2.0
 MAX_BACKOFF_SECONDS = 30.0
 MAX_RETRY_AFTER_SECONDS = 60.0
 
+# Hard cap on any sleep the pipeline takes because of a Retry-After header. One
+# hostile or stale header must not freeze the scraping cycle, and this cap also
+# bounds the pause the pipeline adds between jobs after a transient failure.
+RETRY_AFTER_SLEEP_CAP_SECONDS = 30.0
+
+# Hard ceiling on the per-job analysis retry budget. Configuration may lower it
+# but can never raise it past this, mirroring SearchPlanner.MAX_REMOTE_SEARCHES.
+# Cycles run about every 5 minutes, so 10 attempts keep a poisoned row retrying
+# for under an hour while still surviving a multi-hour rate-limit window.
+MAX_ANALYSIS_ATTEMPTS_CAP = 10
+
 # HTTP status codes that are worth retrying: request timeout, too early, and
 # rate limiting. Every 5xx is transient as well.
 _TRANSIENT_STATUS_CODES = frozenset({408, 425, 429})
@@ -146,11 +157,47 @@ def compute_backoff(attempt: int, retry_after: Optional[float] = None) -> float:
     Bounded delay before the next key rotation.
 
     Honors ``Retry-After`` when the API provides it; otherwise falls back to
-    capped exponential backoff (2s, 4s, 8s, ... up to 30s).
+    capped exponential backoff (2s, 4s, 8s, ... up to 30s). Both branches are
+    capped so an unreasonable header cannot stall the cycle.
     """
     if retry_after is not None:
         return min(max(retry_after, 0.0), MAX_RETRY_AFTER_SECONDS)
     return min(DEFAULT_BACKOFF_SECONDS * (2 ** max(attempt, 0)), MAX_BACKOFF_SECONDS)
+
+
+def retry_after_sleep(retry_after: Optional[float]) -> float:
+    """
+    Pipeline pause derived from a ``Retry-After`` value, capped for safety.
+
+    Consumes the value the caller received on ``TransientAnalysisError`` so the
+    pipeline backs off instead of hammering a rate-limited API with the next job.
+    ``extract_retry_after`` has already normalized both the numeric-seconds and
+    HTTP-date forms to seconds; this only clamps the result, warning when the
+    requested wait exceeds ``RETRY_AFTER_SLEEP_CAP_SECONDS``.
+    """
+    if retry_after is None:
+        return 0.0
+    if retry_after > RETRY_AFTER_SLEEP_CAP_SECONDS:
+        logger.warning(
+            "Retry-After %.1fs exceeds the %.1fs cap; clamping the pause.",
+            retry_after,
+            RETRY_AFTER_SLEEP_CAP_SECONDS,
+        )
+        return RETRY_AFTER_SLEEP_CAP_SECONDS
+    return max(retry_after, 0.0)
+
+
+def cap_analysis_attempts(configured: Optional[int]) -> int:
+    """
+    Clamp the configured analysis retry budget to a hard cap.
+
+    A configuration value of 1000 must not allow 1000 retry cycles per job, so
+    the effective budget is ``min(configured, MAX_ANALYSIS_ATTEMPTS_CAP)``. A
+    non-positive value keeps its original meaning (no retries).
+    """
+    if configured is None:
+        return 0
+    return min(int(configured), MAX_ANALYSIS_ATTEMPTS_CAP)
 
 
 def should_reanalyze(

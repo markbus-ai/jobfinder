@@ -19,7 +19,12 @@ from services.RedisServices import MemoryQueue
 from services.CVGenerator import generate_cv, generate_custom_typst
 from services.EmailService import EmailService
 from services.LocationPolicy import classify_location, is_notifiable
-from services.AnalysisRetry import TransientAnalysisError, should_reanalyze
+from services.AnalysisRetry import (
+    TransientAnalysisError,
+    cap_analysis_attempts,
+    retry_after_sleep,
+    should_reanalyze,
+)
 from services.EnglishPolicy import (
     ENGLISH_LEVELS,
     english_allowed,
@@ -213,6 +218,9 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
 
     notifications = []
 
+    # Config may lower the retry budget but never raise it past the hard cap.
+    max_analysis_attempts = cap_analysis_attempts(settings.MAX_ANALYSIS_ATTEMPTS)
+
     with Session(engine) as session:
         for job in scraped_jobs:
             # Deduplicate by URL. A transiently failed row with attempts left is
@@ -222,7 +230,7 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                 if not should_reanalyze(
                     existing_job.analysis_failed,
                     existing_job.analysis_attempts,
-                    settings.MAX_ANALYSIS_ATTEMPTS,
+                    max_analysis_attempts,
                 ):
                     # A stored row skipped by dedup may still be releasable if
                     # MAX_ENGLISH_LEVEL was raised after it was withheld. That
@@ -267,7 +275,7 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                 # A rate limit / network blip must never be frozen as a 0/100.
                 job.analysis_attempts = (job.analysis_attempts or 0) + 1
                 job.analysis_failed = True
-                if job.analysis_attempts >= settings.MAX_ANALYSIS_ATTEMPTS:
+                if job.analysis_attempts >= max_analysis_attempts:
                     # Exhausted: persist a permanent 0 so it never loops forever.
                     job.ai_match_score = 0
                     job.ai_summary = f"Analysis failed after {job.analysis_attempts} attempts"
@@ -275,11 +283,16 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                     job.missing_skills = json.dumps(["Analysis failed: transient error"])
                 logger.warning(
                     f"Transient AI failure for {job.title} @ {job.company} "
-                    f"(attempt {job.analysis_attempts}/{settings.MAX_ANALYSIS_ATTEMPTS}, "
-                    f"status={e.status_code or 'n/a'}); not notifying, retrying later."
+                    f"(attempt {job.analysis_attempts}/{max_analysis_attempts}, "
+                    f"status={e.status_code or 'n/a'}, "
+                    f"retry_after={e.retry_after if e.retry_after is not None else 'n/a'}); "
+                    f"not notifying, retrying later."
                 )
                 session.add(job)
                 session.commit()
+                # Honor Retry-After so the next job in this cycle does not hammer
+                # a rate-limited API. Capped by retry_after_sleep.
+                time.sleep(retry_after_sleep(e.retry_after))
                 continue
 
             # Small delay between API calls to respect rate limits

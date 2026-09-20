@@ -3,7 +3,10 @@ FIX 2: a transient failure (HTTP 429, connection error, timeout, 5xx) must not
 be persisted as a permanent 0/100, and a retryable row must be re-analyzed.
 """
 
+import logging
 import types
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
 import httpx
 import groq
@@ -12,11 +15,15 @@ from sqlmodel import Session
 
 from models.JobModels import Job
 from services.AnalysisRetry import (
+    MAX_ANALYSIS_ATTEMPTS_CAP,
+    RETRY_AFTER_SLEEP_CAP_SECONDS,
     TransientAnalysisError,
+    cap_analysis_attempts,
     compute_backoff,
     extract_retry_after,
     extract_status_code,
     is_transient_exception,
+    retry_after_sleep,
     should_reanalyze,
 )
 from services.GroqService import AIService, JobAudit
@@ -79,6 +86,16 @@ def test_extract_retry_after_is_bounded():
     assert extract_retry_after(exc) == 60.0
 
 
+def test_extract_retry_after_parses_http_date():
+    # Retry-After is honored in both documented forms: numeric seconds and an
+    # HTTP-date. This locks the HTTP-date branch, which had no coverage.
+    when = datetime.now(timezone.utc) + timedelta(seconds=30)
+    exc = _status_error(groq.RateLimitError, 429, retry_after=format_datetime(when, usegmt=True))
+    value = extract_retry_after(exc)
+    assert value is not None
+    assert 25.0 <= value <= 60.0
+
+
 def test_extract_status_code_walks_the_wrapper_chain():
     inner = _status_error(groq.RateLimitError, 429)
     wrapper = RuntimeError("wrapped")
@@ -133,6 +150,30 @@ def test_compute_backoff_is_bounded_exponential():
     assert compute_backoff(1) == 4.0
     assert compute_backoff(2) == 8.0
     assert compute_backoff(20) == 30.0
+
+
+def test_retry_after_sleep_is_capped():
+    assert retry_after_sleep(None) == 0.0
+    assert retry_after_sleep(7) == 7.0
+    assert retry_after_sleep(-3) == 0.0
+    assert retry_after_sleep(9999) == RETRY_AFTER_SLEEP_CAP_SECONDS
+
+
+# --- W5: the analysis retry budget has a hard cap ----------------------------
+
+def test_analysis_attempts_hard_cap():
+    assert MAX_ANALYSIS_ATTEMPTS_CAP == 10
+    assert cap_analysis_attempts(1000) == 10
+    assert cap_analysis_attempts(3) == 3
+    assert cap_analysis_attempts(0) == 0
+    assert cap_analysis_attempts(None) == 0
+
+
+def test_default_max_analysis_attempts_config():
+    # G4: the configured default retry budget must not drift upward.
+    from core.config import settings
+
+    assert settings.MAX_ANALYSIS_ATTEMPTS == 3
 
 
 @pytest.mark.parametrize(
@@ -272,6 +313,22 @@ def test_transient_429_does_not_persist_a_permanent_score(fresh_db, cycle_runner
     assert stored.notified is False
     assert notifications == []
     assert calls == [job_id]
+
+
+def test_transient_handler_consumes_retry_after(fresh_db, cycle_runner, caplog):
+    # The pipeline must surface and act on Retry-After instead of ignoring it.
+    job_id = "https://example.com/job/retry-after"
+
+    def analyze(job_arg, cv_data):
+        raise TransientAnalysisError("429 rate limited", status_code=429, retry_after=7.0)
+
+    caplog.set_level(logging.WARNING)
+    _, notifications = cycle_runner([_job(job_id)], analyze)
+
+    stored = _load(job_id)
+    assert stored.analysis_failed is True
+    assert notifications == []
+    assert "retry_after=7.0" in caplog.text
 
 
 def test_dedup_reanalyzes_failed_row_and_skips_healthy_row(fresh_db, cycle_runner):
