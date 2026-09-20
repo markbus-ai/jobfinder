@@ -33,6 +33,8 @@ class Job(SQLModel, table=True):
     is_suitable: Optional[bool] = Field(default=None)
     seniority_mismatch: Optional[bool] = Field(default=None)
     missing_skills: Optional[str] = Field(default=None)  # JSON string list
+    english_required: Optional[str] = Field(default=None)  # "none" | "basic" | "intermediate" | "fluent"
+
     # --- Analysis Retry Bookkeeping ---
     analysis_attempts: int = Field(default=0)
     analysis_failed: bool = Field(default=False)

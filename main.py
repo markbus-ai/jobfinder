@@ -20,6 +20,7 @@ from services.CVGenerator import generate_cv, generate_custom_typst, classify_jo
 from services.EmailService import EmailService
 from services.LocationPolicy import classify_location, is_notifiable
 from services.AnalysisRetry import TransientAnalysisError, should_reanalyze
+from services.EnglishPolicy import english_allowed
 from services.SearchPlanner import build_scrape_plan, parse_csv, summarize_plan
 
 # Logging configuration
@@ -31,6 +32,16 @@ logger = logging.getLogger(__name__)
 # In-memory store for jobs with emails (for button callbacks)
 # Key: job_id, Value: dict with company, email, cv_path, profile
 jobs_with_email: Dict[str, Dict[str, Any]] = {}
+
+# Display labels for the English level shown in the Telegram notification.
+ENGLISH_LEVEL_LABELS = {
+    "none": "No requerido",
+    "basic": "Básico",
+    "intermediate": "Intermedio",
+    "fluent": "Fluido",
+}
+
+
 def _refresh_scraped_fields(target: Job, source: Job) -> Job:
     """
     Copy freshly scraped fields onto an existing persisted row (retry path).
@@ -210,6 +221,10 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                 f"   🌍 AI location: mode={audit.work_mode} country={audit.job_country or 'n/a'} "
                 f"city={audit.job_city or 'n/a'} residence_required={audit.requires_residence_in or 'none'}"
             )
+            logger.info(
+                f"   English: required={audit.english_required} "
+                f"evidence={audit.english_evidence or 'n/a'}"
+            )
 
             # Update model fields from audit
             job.ai_match_score = audit.match_score
@@ -218,15 +233,27 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
             job.seniority_mismatch = audit.seniority_mismatch
             job.recommended_profile = audit.recommended_profile
             job.missing_skills = json.dumps(audit.missing_skills) if audit.missing_skills else "[]"
+            job.english_required = audit.english_required
             job.analysis_failed = False
 
+            # Notification gate: location + score + English ceiling. The English
+            # level only exists after the AI call, so it is applied here and not
+            # in the location gate (which runs before any AI call).
+            notifiable = is_notifiable(
+                job.location_eligible, job.ai_match_score, settings.MIN_MATCH_SCORE
+            ) and english_allowed(job.english_required, settings.MAX_ENGLISH_LEVEL)
+            if not notifiable and job.ai_match_score is not None and job.ai_match_score >= settings.MIN_MATCH_SCORE:
+                logger.info(
+                    f"   Withheld: English level '{job.english_required}' exceeds "
+                    f"MAX_ENGLISH_LEVEL='{settings.MAX_ENGLISH_LEVEL}'."
+                )
 
             # --- CV Generation for suitable jobs ---
             cv_generated = False
             cv_path = None
             company_email = None
 
-            if is_notifiable(job.location_eligible, job.ai_match_score, settings.MIN_MATCH_SCORE):
+            if notifiable:
                 # 1. Generate customized CV content via Groq
                 try:
                     cv_content = ai_service.generate_cv_content(job, audit)
@@ -259,7 +286,7 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                     logger.info(f"   📧 Email found: {company_email}")
 
             # --- Notification ---
-            if is_notifiable(job.location_eligible, job.ai_match_score, settings.MIN_MATCH_SCORE) and not job.notified:
+            if notifiable and not job.notified:
                 # Mark as notified first
                 job.notified = True
 
@@ -283,6 +310,7 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                     "missing_skills": json.loads(job.missing_skills) if job.missing_skills else [],
                     "seniority_mismatch": job.seniority_mismatch,
                     "is_suitable": job.is_suitable,
+                    "english_required": job.english_required,
                     "recommended_profile": audit.recommended_profile,
                     "cv_generated": cv_generated,
                     "cv_path": cv_path,
@@ -338,12 +366,18 @@ async def scraper_scheduler(queue: MemoryQueue):
                         company_email = job_data.get('company_email')
                         email_status = f"📧 {company_email}" if company_email else "📧 Sin email"
 
+                        # English level required by the listing
+                        english_level = ENGLISH_LEVEL_LABELS.get(
+                            job_data.get('english_required'), job_data.get('english_required') or "n/a"
+                        )
+
                         msg_text = (
                             f"🚀 <b>{suitability_icon} {job_data['match_score']}/100</b>\n\n"
                             f"🏢 <b>{job_data['company']}</b>\n"
                             f"💼 {job_data['title']}\n"
                             f"📍 {job_data['location']}\n\n"
                             f"📋 {profile_label}\n"
+                            f"Inglés: {english_level}\n"
                             f"📉 Skills: <i>{skills_text}</i>"
                             f"{seniority_alert}\n\n"
                             f"📝 {job_data['summary']}\n\n"

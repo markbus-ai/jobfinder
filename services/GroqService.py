@@ -255,6 +255,29 @@ class JobAudit(BaseModel):
             "Must be a plain country/region name only, never free prose. Empty string when none."
         ),
     )
+    english_required: str = Field(
+        default="intermediate",
+        description=(
+            "English level the listing requires, judged ONLY from the listing text. One of: "
+            "'none' = no English needed (listing is fully in Spanish/Portuguese or states no "
+            "language requirement); "
+            "'basic' = only reading simple English docs or occasional English terms; "
+            "'intermediate' = can read/write technical English and join occasional English "
+            "meetings; "
+            "'fluent' = day-to-day spoken English, meetings with English-speaking clients or "
+            "teams, or an explicit 'fluent English required'. "
+            "Default to 'intermediate' when the listing says nothing about English; never guess "
+            "'fluent' without evidence."
+        ),
+    )
+    english_evidence: str = Field(
+        default="",
+        description=(
+            "Short quote from the listing that justifies english_required "
+            "(e.g. 'fluent English required', 'English is a plus'). Empty string when the "
+            "listing says nothing about English."
+        ),
+    )
 
 
 class CVContent(BaseModel):
@@ -353,6 +376,8 @@ class AIService:
                 job_country="",
                 job_city="",
                 requires_residence_in="",
+                english_required="intermediate",
+                english_evidence="",
             )
 
         max_retries = max(len(self._keys) * 2, 1)  # Try each key up to 2 times
@@ -425,7 +450,14 @@ class AIService:
                                 "(e.g., 'programming', 'web development').\n"
                                 "10. MISSING DATA: If the candidate profile is missing, empty, or does not allow you "
                                 "to verify the required stack, return match_score = 0 and is_suitable = false. Never "
-                                "guess or default to a confident score."
+                                "guess or default to a confident score.\n"
+                                "11. ENGLISH LEVEL: Judge 'english_required' from the listing text only, using the "
+                                "closed vocabulary 'none', 'basic', 'intermediate', 'fluent'. Use 'fluent' only with "
+                                "explicit evidence such as meetings with English-speaking clients/teams, "
+                                "'fluent English required', or the whole listing being in English. 'English is a plus' "
+                                "is at most 'intermediate'. When the listing says nothing about English, default to "
+                                "'intermediate' rather than guessing 'fluent'. Quote the justifying text in "
+                                "'english_evidence', or leave it empty when the listing says nothing."
                             ),
                         },
                         {
@@ -473,6 +505,8 @@ class AIService:
             short_verdict=f"Error técnico: {str(last_error)[:50]}",
             recommended_profile="backend",
             key_requirements=[],
+            english_required="intermediate",
+            english_evidence="",
         )
 
     def generate_cv_content(self, job: Job, audit: JobAudit) -> CVContent:

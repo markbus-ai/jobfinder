@@ -64,6 +64,10 @@ class Settings(BaseModel):
     # Analysis retry: how many times a transiently failed job may be re-analyzed
     MAX_ANALYSIS_ATTEMPTS: int = int(os.getenv("MAX_ANALYSIS_ATTEMPTS", "3"))
 
+    # Highest English level the candidate accepts ("none" | "basic" | "intermediate" | "fluent").
+    # Default "intermediate" withholds fluent-English roles.
+    MAX_ENGLISH_LEVEL: str = os.getenv("MAX_ENGLISH_LEVEL", "intermediate")
+
     # CV generation
     CV_OUTPUT_DIR: str = os.getenv("CV_OUTPUT_DIR", "/tmp/jobfinder_cvs")
 
