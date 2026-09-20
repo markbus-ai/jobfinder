@@ -219,36 +219,64 @@ SCORING_PROFILE = {
 # it here keeps the model from ever being told a level the gate does not know.
 _QUOTED_ENGLISH_LEVELS = ", ".join(f"'{level}'" for level in ENGLISH_LEVELS)
 
-# Ordered to match ENGLISH_LEVELS (ascending difficulty) so the meaning of each
-# level stays attached to the right key.
-_ENGLISH_LEVEL_MEANINGS = (
-    "no English needed (listing is fully in Spanish/Portuguese or states no language requirement)",
-    "only reading simple English docs or occasional English terms",
-    "can read/write technical English and join occasional English meetings",
-    "day-to-day spoken English, meetings with English-speaking clients or teams, "
-    "or an explicit 'fluent English required'",
+# The single 'fluent' definition, reused verbatim by the response schema and by
+# rule 11 so the two can never drift into divergent meanings. 'fluent' requires
+# explicit evidence of SPOKEN English. A listing merely WRITTEN in English does
+# NOT qualify: many LATAM/remote listings are written in English without
+# requiring spoken English, so they are at most 'intermediate'.
+_FLUENT_DEFINITION = (
+    "day-to-day spoken English backed by explicit evidence: meetings or daily "
+    "syncs with English-speaking clients or teams, an explicit 'fluent English "
+    "required', or interviews conducted in English; a listing that is merely "
+    "WRITTEN in English is at most 'intermediate', never 'fluent'"
 )
+
+# Silence must map to 'intermediate', NEVER to null. The real corpus is
+# overwhelmingly silent about English (98.8% of listings), and a null answer is
+# withheld fail-closed in code, which would keep every otherwise-good match out
+# of the notification pipeline. This sentence is load-bearing; the tests assert
+# it stays in the field description.
+_ENGLISH_SILENCE_RULE = (
+    "Most listings say nothing about English and silence is not a requirement: "
+    "when the listing does not mention English, default to 'intermediate'. Never "
+    "answer null for silence; reserve null for nothing and always answer one of "
+    "the four levels."
+)
+
+# Meaning of each closed-vocabulary level, keyed by level so a new level cannot
+# be added without a meaning (completeness is asserted at import time below).
+_ENGLISH_LEVEL_MEANINGS: dict[str, str] = {
+    "none": "no English needed (listing is fully in Spanish/Portuguese or states no language requirement)",
+    "basic": "only reading simple English docs or occasional English terms",
+    "intermediate": "can read/write technical English and join occasional English meetings",
+    "fluent": _FLUENT_DEFINITION,
+}
+assert set(_ENGLISH_LEVEL_MEANINGS) == set(ENGLISH_LEVELS), (
+    "Every English level needs a meaning; add the missing level(s) to "
+    "_ENGLISH_LEVEL_MEANINGS."
+)
+
 _ENGLISH_REQUIRED_DESCRIPTION = (
     "English level the listing requires, judged ONLY from the listing text. One of "
     + "; ".join(
-        f"'{level}' = {meaning}"
-        for level, meaning in zip(ENGLISH_LEVELS, _ENGLISH_LEVEL_MEANINGS)
+        f"'{level}' = {_ENGLISH_LEVEL_MEANINGS[level]}"
+        for level in ENGLISH_LEVELS
     )
-    + ". Use null when the listing is silent or the level cannot be judged. "
-    "Default to 'intermediate' when the listing says nothing about English; never "
-    "guess 'fluent' without evidence."
+    + ". "
+    + _ENGLISH_SILENCE_RULE
+    + " 'English is a plus' is at most 'intermediate'."
 )
 
-# Rule 11 of the analysis system prompt. The default sentence is load-bearing:
-# without it the model guesses 'fluent' more often, which the gate then withholds.
+# Rule 11 of the analysis system prompt. The silence sentence is load-bearing:
+# without it the model guesses 'fluent' (or answers null) more often, which the
+# gate then withholds. It reuses the same fluent and silence definitions as the
+# field description above.
 ENGLISH_LEVEL_PROMPT = (
     "11. ENGLISH LEVEL: Judge 'english_required' from the listing text only, using the "
-    f"closed vocabulary {_QUOTED_ENGLISH_LEVELS}. Use 'fluent' only with "
-    "explicit evidence such as meetings with English-speaking clients/teams, "
-    "'fluent English required', or the whole listing being in English. 'English is a plus' "
-    "is at most 'intermediate'. When the listing says nothing about English, default to "
-    "'intermediate' rather than guessing 'fluent'. Quote the justifying text in "
-    "'english_evidence', or leave it empty when the listing says nothing."
+    f"closed vocabulary {_QUOTED_ENGLISH_LEVELS}. Use 'fluent' only for "
+    f"{_FLUENT_DEFINITION}. 'English is a plus' is at most 'intermediate'. "
+    f"{_ENGLISH_SILENCE_RULE} Quote the justifying text in 'english_evidence', or "
+    "leave it empty when the listing says nothing."
 )
 
 
