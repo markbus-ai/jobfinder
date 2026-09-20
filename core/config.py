@@ -5,6 +5,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable robustly."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 class Settings(BaseModel):
     PROJECT_NAME: str = "JobFinder"
 
@@ -35,6 +43,15 @@ class Settings(BaseModel):
     CANDIDATE_NAME: str = os.getenv("CANDIDATE_NAME", "Marcos Bustos")
     CANDIDATE_EMAIL: str = os.getenv("CANDIDATE_EMAIL", "marcosbustos.dev@gmail.com")
     CANDIDATE_LOCATION: str = os.getenv("CANDIDATE_LOCATION", "Mar del Plata, Argentina")
+
+    # Location eligibility policy
+    CANDIDATE_CITY: str = os.getenv("CANDIDATE_CITY", "Mar del Plata")
+    CANDIDATE_COUNTRY: str = os.getenv("CANDIDATE_COUNTRY", "Argentina")
+    ALLOW_REMOTE: bool = env_bool("ALLOW_REMOTE", True)
+    BLOCK_FOREIGN_RESTRICTED_REMOTE: bool = env_bool("BLOCK_FOREIGN_RESTRICTED_REMOTE", True)
+
+    # Notification threshold (technical match score, 0-100)
+    MIN_MATCH_SCORE: int = int(os.getenv("MIN_MATCH_SCORE", "70"))
 
     # CV generation
     CV_OUTPUT_DIR: str = os.getenv("CV_OUTPUT_DIR", "/tmp/jobfinder_cvs")
