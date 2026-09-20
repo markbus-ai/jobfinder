@@ -166,6 +166,7 @@ def test_analysis_attempts_hard_cap():
     assert cap_analysis_attempts(1000) == 10
     assert cap_analysis_attempts(3) == 3
     assert cap_analysis_attempts(0) == 0
+    assert cap_analysis_attempts(-5) == 0
     assert cap_analysis_attempts(None) == 0
 
 

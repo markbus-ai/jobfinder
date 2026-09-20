@@ -193,11 +193,11 @@ def cap_analysis_attempts(configured: Optional[int]) -> int:
 
     A configuration value of 1000 must not allow 1000 retry cycles per job, so
     the effective budget is ``min(configured, MAX_ANALYSIS_ATTEMPTS_CAP)``. A
-    non-positive value keeps its original meaning (no retries).
+    value at or below zero means no retries; negative values are clamped to 0.
     """
     if configured is None:
         return 0
-    return min(int(configured), MAX_ANALYSIS_ATTEMPTS_CAP)
+    return min(max(int(configured), 0), MAX_ANALYSIS_ATTEMPTS_CAP)
 
 
 def should_reanalyze(

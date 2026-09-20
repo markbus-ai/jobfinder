@@ -10,6 +10,10 @@ The level is a small, closed vocabulary and the comparison is done on an ordered
 enum, never on arbitrary text. Anything missing or outside the vocabulary fails
 CLOSED (withheld).
 
+The location-plus-score part of the notification gate is delegated to
+``services.LocationPolicy.is_notifiable`` rather than re-implemented here, so the
+two can never drift. Both modules depend only on the standard library.
+
 ``EnglishLevelLiteral`` is the single source of truth for that vocabulary: the
 enum, the ordinal ranking, the AI response schema, the prompt wording, and the
 Telegram display labels all derive from ``ENGLISH_LEVELS``. Add a level here
@@ -20,6 +24,8 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Literal, Optional, get_args
+
+from services.LocationPolicy import is_notifiable as _location_is_notifiable
 
 
 # Single source of truth for the closed vocabulary, in ascending difficulty
@@ -100,8 +106,6 @@ def is_notifiable_with_stored_english(
     """
     if notified or analysis_failed:
         return False
-    if location_eligible is not True:
-        return False
-    if match_score is None or match_score < min_match_score:
+    if not _location_is_notifiable(location_eligible, match_score, min_match_score):
         return False
     return english_allowed(english_required, max_english_level)

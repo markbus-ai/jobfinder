@@ -287,6 +287,7 @@ def test_raising_ceiling_releases_stored_row_without_ai(fresh_db, cycle_runner):
     [
         (50, True, False, False),   # below the score threshold
         (90, False, False, False),  # location-ineligible
+        (90, None, False, False),   # location verdict unknown (NULL) must stay closed
         (90, True, True, False),    # failed analysis (belongs to the retry path)
         (90, True, False, True),    # already notified
     ],
@@ -306,6 +307,24 @@ def test_stored_english_predicate_rejects_non_withheld_rows(
         )
         is False
     )
+
+
+@pytest.mark.parametrize("location_eligible", [True, False, None])
+def test_stored_english_predicate_delegates_location_and_score(location_eligible):
+    # The stored-row gate must delegate the location+score rule to
+    # LocationPolicy.is_notifiable so the two can never drift. This locks the
+    # equivalence, including location_eligible=None (which must stay closed).
+    from services.LocationPolicy import is_notifiable
+
+    assert is_notifiable_with_stored_english(
+        location_eligible=location_eligible,
+        match_score=90,
+        notified=False,
+        analysis_failed=False,
+        english_required="fluent",
+        min_match_score=70,
+        max_english_level="fluent",
+    ) is is_notifiable(location_eligible, 90, 70)
 
 
 def test_stored_english_predicate_accepts_releasable_row():
