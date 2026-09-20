@@ -149,6 +149,7 @@ _CITY_ENTRIES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("Nezahualcoyotl", "Mexico", ("nezahualcoyotl",)),
     ("Torreon", "Mexico", ("torreon",)),
     ("Tijuana", "Mexico", ("tijuana",)),
+    ("Toluca", "Mexico", ("toluca",)),
     ("Leon", "Mexico", ("leon",)),
     # Colombia
     ("Bogota", "Colombia", ("bogota",)),
@@ -228,6 +229,7 @@ _ARGENTINA_CITIES: tuple[tuple[str, tuple[str, ...]], ...] = (
 _REMOTE_KEYWORDS = (
     "remote", "remoto", "remota", "remotamente", "teletrabajo",
     "work from home", "home office", "trabajo remoto",
+    "anywhere", "worldwide", "world wide", "work from anywhere",
 )
 _HYBRID_KEYWORDS = ("hybrid", "hibrido", "hibrida", "mixto", "mixed")
 _ONSITE_KEYWORDS = (
@@ -235,16 +237,24 @@ _ONSITE_KEYWORDS = (
     "face to face", "presencialidad",
 )
 
-# Mentions that explicitly remove a residence restriction.
-_NO_RESTRICTION_KEYWORDS = (
+# Regions that explicitly open a listing to the candidate's country. A listing
+# mentioning any of these is open to Argentina even when its location anchor is
+# a foreign city. Regions that EXCLUDE Argentina (US, EU, EMEA, APAC, ...) are
+# deliberately absent here: they are treated as residence restrictions instead.
+_OPENNESS_KEYWORDS = (
     "anywhere", "worldwide", "world wide", "global", "globally",
+    "international", "remote first", "fully remote", "work from anywhere",
     "latam", "latin america", "america latina", "latinoamerica",
-    "international", "any location", "any country",
+    "americas", "south america", "sudamerica", "any location", "any country",
 )
 
+# Tokens that turn a country word into part of a place name, e.g. the Uruguayan
+# town "Villa Argentina" is not the country Argentina.
+_PLACE_NAME_PREFIXES = ("villa",)
 
-def _build_place_regexes() -> tuple[re.Pattern, re.Pattern]:
-    """Build (country_pattern, city_pattern) matching any known place alias."""
+
+def _build_place_regexes() -> tuple[re.Pattern, re.Pattern, re.Pattern]:
+    """Build (country, foreign-city, argentina-city) regexes over known aliases."""
     country_aliases = sorted(
         (alias for aliases in _COUNTRY_ALIASES.values() for alias in aliases),
         key=len,
@@ -255,16 +265,24 @@ def _build_place_regexes() -> tuple[re.Pattern, re.Pattern]:
         key=len,
         reverse=True,
     )
+    arg_city_aliases = sorted(
+        (alias for _, aliases in _ARGENTINA_CITIES for alias in aliases),
+        key=len,
+        reverse=True,
+    )
     country_pattern = re.compile(
         r"(?<!\w)(" + "|".join(re.escape(a) for a in country_aliases) + r")(?!\w)"
     )
     city_pattern = re.compile(
         r"(?<!\w)(" + "|".join(re.escape(a) for a in city_aliases) + r")(?!\w)"
     )
-    return country_pattern, city_pattern
+    arg_city_pattern = re.compile(
+        r"(?<!\w)(" + "|".join(re.escape(a) for a in arg_city_aliases) + r")(?!\w)"
+    )
+    return country_pattern, city_pattern, arg_city_pattern
 
 
-_COUNTRY_REGEX, _CITY_REGEX = _build_place_regexes()
+_COUNTRY_REGEX, _CITY_REGEX, _ARG_CITY_REGEX = _build_place_regexes()
 
 # alias -> canonical country (longest aliases resolved first by regex alternation)
 _ALIAS_TO_COUNTRY: dict[str, str] = {
@@ -305,10 +323,19 @@ def _candidate_city_aliases(city: str) -> set[str]:
     return {alias for alias in aliases if alias}
 
 
+def _is_place_name_prefix(text: str, match_start: int) -> bool:
+    """True when the match is preceded by a token that turns it into a place name."""
+    before = text[:match_start].split()
+    return bool(before) and before[-1] in _PLACE_NAME_PREFIXES
+
+
 def _detect_countries(text: str) -> list[str]:
     """Canonical countries mentioned in the text, in order of appearance."""
     found: list[tuple[int, str]] = []
     for match in _COUNTRY_REGEX.finditer(text):
+        if _is_place_name_prefix(text, match.start()):
+            # "Villa Argentina" is a place name, not a country mention.
+            continue
         country = _ALIAS_TO_COUNTRY.get(match.group(1))
         if country:
             found.append((match.start(), country))
@@ -332,11 +359,10 @@ def _detect_cities(text: str) -> list[tuple[int, str, str]]:
 
 
 def _detect_argentina_cities(text: str) -> list[tuple[int, str]]:
+    """Known Argentine (non-candidate) cities in the text as (position, display)."""
     found: list[tuple[int, str]] = []
-    for match in _CITY_REGEX.finditer(text):
-        alias = match.group(1)
-        if alias in _ALIAS_TO_ARG_CITY:
-            found.append((match.start(), _ALIAS_TO_ARG_CITY[alias]))
+    for match in _ARG_CITY_REGEX.finditer(text):
+        found.append((match.start(), _ALIAS_TO_ARG_CITY[match.group(1)]))
     return found
 
 
@@ -350,6 +376,8 @@ def _detect_city_display(text: str, candidate_aliases: set[str]) -> Optional[str
     for match in _CITY_REGEX.finditer(text):
         display, _ = _ALIAS_TO_CITY[match.group(1)]
         candidates.append((match.start(), display))
+    for match in _ARG_CITY_REGEX.finditer(text):
+        candidates.append((match.start(), _ALIAS_TO_ARG_CITY[match.group(1)]))
     for alias in candidate_aliases:
         idx = text.find(alias)
         if idx != -1:
@@ -373,12 +401,68 @@ def _ordered_unique(pairs: list[tuple[int, str]]) -> list[str]:
 def _has_known_city(text: str, candidate_aliases: set[str]) -> bool:
     if _CITY_REGEX.search(text):
         return True
-    if any(_contains_phrase(text, alias) for alias in _ALIAS_TO_ARG_CITY):
+    if _ARG_CITY_REGEX.search(text):
         return True
     return _detect_candidate_city(text, candidate_aliases)
 
 
 # --- Residence restriction detection ---------------------------------------
+
+# Bounded surface forms for a bare "US", which is deliberately NOT a generic
+# country alias (so "join us", "Indianapolis", "Ukulele" never match). Each
+# pattern requires a restriction context: a remote qualifier, "only", a
+# residence verb, or "within the US".
+_US_RESTRICTION_PATTERNS = (
+    re.compile(r"\bremote\s*\(\s*(?:us|u s|usa)\s*\)"),
+    re.compile(r"\bremote\s*,\s*(?:us|u s|usa)\b"),
+    re.compile(r"\b(?:us|u s|usa)\s+remote\b"),
+    re.compile(r"\bremote\s+within\s+(?:the\s+)?(?:us|u s|usa)\b"),
+    re.compile(rf"\bremote\s+(?:only\s+)?(?:from\s+|in\s+|for\s+|at\s+)?(?:the\s+)?(?:us|u s|usa)\b"),
+    re.compile(r"\bwithin\s+(?:the\s+)?(?:us|usa)\b"),
+    re.compile(r"\b(?:us|u s|usa)\s+only\b"),
+    re.compile(r"\bonly\s+(?:us|u s|usa)\b"),
+    re.compile(
+        rf"\b(?:must|should|need(?:s)?\s+to)\s+(?:reside|live|be\s+based)\s+in\s+"
+        rf"(?:the\s+)?(?:us|u s|usa|united states)\b"
+    ),
+    re.compile(rf"\b(?:candidates?|applicants?|developers?|employees?)\s+(?:must\s+)?"
+               rf"(?:reside|live|be\s+based)\s+in\s+(?:the\s+)?(?:us|u s|usa|united states)\b"),
+)
+
+# "EU only" style restrictions are foreign regions, not named countries.
+_EU_RESTRICTION_PATTERNS = (
+    re.compile(r"\bremote\s*\(\s*(?:eu|europe|european union)\s*\)"),
+    re.compile(r"\bremote\s*,\s*(?:eu|europe)\b"),
+    re.compile(r"\bremote\s+within\s+(?:the\s+)?(?:eu|europe|european union)\b"),
+    re.compile(rf"\bremote\s+(?:only\s+)?(?:from\s+|in\s+|for\s+|at\s+)?(?:the\s+)?(?:eu|europe|european union)\b"),
+    re.compile(r"\bwithin\s+(?:the\s+)?(?:eu|europe|european union)\b"),
+    re.compile(r"\b(?:eu|europe|european union)\s+only\b"),
+    re.compile(r"\bonly\s+(?:eu|europe|european union)\b"),
+    re.compile(
+        rf"\b(?:must|should|need(?:s)?\s+to)\s+(?:reside|live|be\s+based)\s+in\s+"
+        rf"(?:the\s+)?(?:eu|europe|european union)\b"
+    ),
+)
+
+# Other foreign regions that exclude Argentina and name no country.
+_REGION_RESTRICTION_PATTERNS = (
+    re.compile(r"\bremote\s*\(\s*(?:emea|apac)\s*\)"),
+    re.compile(r"\bremote\s*,\s*(?:emea|apac)\b"),
+    re.compile(r"\bremote\s+within\s+(?:the\s+)?(?:emea|apac)\b"),
+    re.compile(r"\bremote\s+(?:only\s+)?(?:from\s+|in\s+|for\s+|at\s+)?(?:the\s+)?(?:emea|apac)\b"),
+    re.compile(r"\bwithin\s+(?:the\s+)?(?:emea|apac)\b"),
+    re.compile(r"\b(?:emea|apac)\s+only\b"),
+    re.compile(r"\bonly\s+(?:emea|apac)\b"),
+)
+
+_REGION_TO_COUNTRY = {
+    "eu": "European Union",
+    "europe": "European Union",
+    "european union": "European Union",
+    "emea": "EMEA",
+    "apac": "APAC",
+}
+
 
 def _build_restriction_patterns() -> list[re.Pattern]:
     country = "(?:" + "|".join(
@@ -392,7 +476,12 @@ def _build_restriction_patterns() -> list[re.Pattern]:
     city = "(?:" + "|".join(
         re.escape(a)
         for a in sorted(
-            (alias for _, _, aliases in _CITY_ENTRIES for alias in aliases),
+            (
+                alias
+                for entries in (_CITY_ENTRIES, _ARGENTINA_CITIES)
+                for entry in entries
+                for alias in entry[-1]
+            ),
             key=len,
             reverse=True,
         )
@@ -417,23 +506,6 @@ def _build_restriction_patterns() -> list[re.Pattern]:
 
 _RESTRICTION_PATTERNS = _build_restriction_patterns()
 
-# Bare "US" is only recognized inside a restriction phrase, never as a generic
-# country mention (avoids matching phrases like "join us").
-_US_RESTRICTION_PATTERNS = (
-    re.compile(r"\bremote\s+(?:only\s+)?(?:from\s+|in\s+|for\s+)?(?:us|u s|usa)\b"),
-    re.compile(r"\b(?:us|u s|usa)\s+only\b"),
-    re.compile(r"\bonly\s+(?:us|u s|usa)\b"),
-)
-
-# "EU only" style restrictions are foreign regions, not named countries.
-_EU_RESTRICTION_PATTERNS = (
-    re.compile(r"\bremote\s+(?:only\s+)?(?:from\s+|in\s+|for\s+)?(?:eu|europe|european union)\b"),
-    re.compile(r"\b(?:eu|europe|european union)\s+only\b"),
-    re.compile(r"\bonly\s+(?:eu|europe|european union)\b"),
-)
-
-_REGION_TO_COUNTRY = {"eu": "European Union", "europe": "European Union", "european union": "European Union"}
-
 
 def _place_to_country(raw: str) -> Optional[str]:
     normalized = _normalize(raw)
@@ -441,6 +513,8 @@ def _place_to_country(raw: str) -> Optional[str]:
         return _ALIAS_TO_COUNTRY[normalized]
     if normalized in _ALIAS_TO_CITY:
         return _ALIAS_TO_CITY[normalized][1]
+    if normalized in _ALIAS_TO_ARG_CITY:
+        return "Argentina"
     if normalized in _REGION_TO_COUNTRY:
         return _REGION_TO_COUNTRY[normalized]
     if normalized in ("us", "u s"):
@@ -449,11 +523,13 @@ def _place_to_country(raw: str) -> Optional[str]:
 
 
 def _find_residence_restriction(text: str) -> Optional[str]:
-    """Return a foreign place named as a residence requirement, or None."""
+    """
+    Return the place named as a residence requirement, or None.
+
+    Explicit openness keywords do NOT suppress a restriction: the classify flow
+    gives an explicit residence requirement precedence over openness.
+    """
     if not text:
-        return None
-    if _has_any(text, _NO_RESTRICTION_KEYWORDS):
-        # An explicit "anywhere/worldwide/LATAM" clause overrides country mentions.
         return None
     for pattern in _US_RESTRICTION_PATTERNS:
         if pattern.search(text):
@@ -461,6 +537,9 @@ def _find_residence_restriction(text: str) -> Optional[str]:
     for pattern in _EU_RESTRICTION_PATTERNS:
         if pattern.search(text):
             return "European Union"
+    for pattern in _REGION_RESTRICTION_PATTERNS:
+        if pattern.search(text):
+            return "EMEA" if "emea" in pattern.pattern else "APAC"
     for pattern in _RESTRICTION_PATTERNS:
         match = pattern.search(text)
         if match:
@@ -468,6 +547,29 @@ def _find_residence_restriction(text: str) -> Optional[str]:
             if country:
                 return country
     return None
+
+
+def _country_from_location(location_norm: str) -> Optional[str]:
+    """
+    Resolve the country from the structured location field.
+
+    Job feeds conventionally put the country in the last comma-separated
+    component, so "Villa Argentina, Canelones, Uruguay" resolves to Uruguay and
+    the place name "Villa Argentina" never counts as the country. Returning None
+    lets the caller fall back to scanning the wider anchor text.
+    """
+    if not location_norm:
+        return None
+    parts = [part.strip() for part in location_norm.split(",") if part.strip()]
+    if not parts:
+        return None
+    countries = _detect_countries(parts[-1])
+    return countries[0] if countries else None
+
+
+def _has_openness(text: str) -> bool:
+    """True when the listing explicitly opens itself to the candidate's region."""
+    return _has_any(text, _OPENNESS_KEYWORDS)
 
 
 # --- Main entry point -------------------------------------------------------
@@ -486,9 +588,15 @@ def classify_location(
     """
     Classify a listing as geographically eligible or blocked.
 
-    Remote detection is text-first: the JobSpy ``is_remote`` flag is unreliable
-    in production data (Barcelona listings arrive flagged remote), so it is only
-    a supporting hint and must be corroborated by the listing text or modality.
+    Precedence: work mode, then an explicit residence requirement (which wins
+    over any openness wording), then explicit openness to a region that includes
+    the candidate's country, then the location anchor as the conservative
+    default.
+
+    Remote detection is text-first. The JobSpy ``is_remote`` flag is unreliable
+    in production data (Barcelona listings arrive flagged remote), but it is
+    still accepted on its own when there is no location text, because several
+    legitimate remote listings ship with an empty location.
     """
     loc_norm = _normalize(location)
     title_norm = _normalize(title)
@@ -521,19 +629,23 @@ def classify_location(
     else:
         work_mode = WorkMode.UNKNOWN
 
-    # Place detection from location + title (the high-signal anchor).
-    countries = _detect_countries(anchor)
-    countries.extend(
-        country for _, _, country in _detect_cities(anchor) if country not in countries
-    )
+    # Place detection. The structured location's country wins over title text so
+    # a place name such as "Villa Argentina" cannot be mistaken for Argentina.
+    country = _country_from_location(loc_norm)
+    if country is None:
+        anchor_countries = _detect_countries(anchor)
+        anchor_countries.extend(
+            found for _, _, found in _detect_cities(anchor) if found not in anchor_countries
+        )
+        country = anchor_countries[0] if anchor_countries else None
     arg_cities = [display for _, display in _detect_argentina_cities(anchor)]
-    if arg_cities and "Argentina" not in countries:
-        countries.append("Argentina")
-    country = countries[0] if countries else None
+    if country is None and arg_cities:
+        country = "Argentina"
     city = _detect_city_display(anchor, candidate_aliases)
     if in_candidate_city:
         city = "Mar del Plata"
 
+    openness = _has_openness(full)
     restriction = _find_residence_restriction(full)
     effective_country = country or restriction
     foreign_restriction = (
@@ -552,7 +664,7 @@ def classify_location(
             human_reason="Remote work is disabled by policy (ALLOW_REMOTE=false).",
         )
 
-    # 2. Explicit foreign residence requirement.
+    # 2. Explicit residence requirement wins over any openness wording.
     if block_foreign_restricted_remote and foreign_restriction:
         return LocationVerdict(
             eligible=False,
@@ -601,9 +713,22 @@ def classify_location(
             ),
         )
 
-    # 5. Foreign country anchored in the location.
+    # 5. Foreign country anchored in the location. Explicit openness to a region
+    #    that includes Argentina overrides the foreign anchor for remote roles.
     if is_foreign:
         if work_mode == WorkMode.REMOTE:
+            if openness:
+                return LocationVerdict(
+                    eligible=True,
+                    reason=REASON_REMOTE_OK,
+                    work_mode=work_mode.value,
+                    country=effective_country,
+                    city=city,
+                    human_reason=(
+                        f"Remote listing anchored in {effective_country} but explicitly "
+                        "open to the candidate's region."
+                    ),
+                )
             if block_foreign_restricted_remote:
                 return LocationVerdict(
                     eligible=False,
