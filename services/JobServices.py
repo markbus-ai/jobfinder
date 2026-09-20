@@ -12,8 +12,8 @@ class JobService:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     def _scrape_safe(self, **kwargs):
         """
-        Ejecuta scrape_jobs con reintentos automáticos ante fallos (Rate limits, errores de red).
-        Backoff exponencial: espera 4s, 8s, 10s... entre reintentos.
+        Run scrape_jobs with automatic retries on failures (rate limits, network errors).
+        Exponential backoff: waits 4s, 8s, 10s... between attempts.
         """
         return scrape_jobs(**kwargs)
 
@@ -26,7 +26,7 @@ class JobService:
         is_remote: bool = False,
     ) -> List[Job]:
         """
-        Consume JobSpy and mapea los resultados a nuestro modelo de SQLModel Job.
+        Consume JobSpy and map the results to our SQLModel Job model.
         """
         try:
             # Llamada a la librería JobSpy (envuelta en retry)
