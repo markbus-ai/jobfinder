@@ -197,7 +197,7 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                     job.is_suitable = False
                     job.missing_skills = json.dumps(["Analysis failed: transient error"])
                 logger.warning(
-                    f"⏳ Transient AI failure for {job.title} @ {job.company} "
+                    f"Transient AI failure for {job.title} @ {job.company} "
                     f"(attempt {job.analysis_attempts}/{settings.MAX_ANALYSIS_ATTEMPTS}, "
                     f"status={e.status_code or 'n/a'}); not notifying, retrying later."
                 )
