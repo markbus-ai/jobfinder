@@ -11,6 +11,30 @@ Policy summary:
   a foreign country.
 - On-site and hybrid work is acceptable only in Mar del Plata.
 - Anything that cannot be classified as eligible fails closed (blocked).
+
+Work mode is resolved with a strict precedence:
+1. An explicit platform ``modality`` is authoritative: remote/remoto/teletrabajo
+   resolve to remote, hybrid/hibrido to hybrid, and onsite/presencial to onsite.
+   It is never overridden by the ``is_remote`` flag, by text, or by openness.
+2. Explicit on-site/hybrid words in the location or title (onsite, on site,
+   presencial, hybrid, hibrido) resolve to on-site/hybrid.
+3. Explicit remote-mode words (remote, remoto, teletrabajo, home office, fully
+   remote, remote work, work from home, trabajo remoto, and the full phrase
+   "work from anywhere") resolve to remote.
+4. Conflicting explicit signals -- both on-site/hybrid and remote words, or a
+   modality that disagrees with strong text -- resolve to hybrid, which is
+   blocked outside Mar del Plata and therefore fails closed.
+5. ``is_remote`` is only a weak hint, used when nothing more specific
+   contradicts it. It never overrides a modality or explicit on-site/hybrid
+   text.
+
+Openness wording ("worldwide", "anywhere", "global", "international", "LATAM",
+"Americas", ...) describes the regions a listing is open to. It is NOT a
+work-mode signal: it can never turn a listing into a remote one. Openness is
+consulted only inside the remote branch of the decision. A structured location
+field that is itself an anonymous location token ("Anywhere", "Worldwide")
+means location-agnostic work and resolves through the remote branch; the same
+words appearing in a title or description carry no such meaning.
 """
 
 from __future__ import annotations
@@ -225,11 +249,13 @@ _ARGENTINA_CITIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Tucuman", ("tucuman",)),
 )
 
-# Work-mode keyword catalogs (normalized text).
-_REMOTE_KEYWORDS = (
+# Work-mode keyword catalogs (normalized text). "worldwide", "world wide" and
+# bare "anywhere" are deliberately absent: they are openness signals, not work
+# modes, and must never decide that a listing is remote.
+_REMOTE_MODE_KEYWORDS = (
     "remote", "remoto", "remota", "remotamente", "teletrabajo",
     "work from home", "home office", "trabajo remoto",
-    "anywhere", "worldwide", "world wide", "work from anywhere",
+    "fully remote", "remote work", "100% remoto", "work from anywhere",
 )
 _HYBRID_KEYWORDS = ("hybrid", "hibrido", "hibrida", "mixto", "mixed")
 _ONSITE_KEYWORDS = (
@@ -246,6 +272,22 @@ _OPENNESS_KEYWORDS = (
     "international", "remote first", "fully remote", "work from anywhere",
     "latam", "latin america", "america latina", "latinoamerica",
     "americas", "south america", "sudamerica", "any location", "any country",
+)
+
+# Structured location fields that mean "the job can be done from anywhere".
+# Unlike prose openness, an anonymous location field resolves through the
+# remote branch. Kept separate from _OPENNESS_KEYWORDS so work-mode detection
+# never references the openness catalog.
+_ANONYMOUS_LOCATION_KEYWORDS = (
+    "anywhere", "worldwide", "world wide", "any location", "any country",
+)
+
+# Regions that include the candidate. When a listing names one of them, a
+# foreign region restriction (EU/EMEA/APAC) does not exclude the candidate,
+# because the listing is an OR-list that already includes the candidate.
+_ALLOW_REGION_KEYWORDS = (
+    "latam", "latin america", "america latina", "latinoamerica",
+    "americas", "south america", "sudamerica",
 )
 
 # Tokens that turn a country word into part of a place name, e.g. the Uruguayan
@@ -406,6 +448,15 @@ def _has_known_city(text: str, candidate_aliases: set[str]) -> bool:
     return _detect_candidate_city(text, candidate_aliases)
 
 
+def _is_anonymous_location(location_norm: str) -> bool:
+    """True when the structured location is a location-agnostic token."""
+    if not location_norm:
+        return False
+    if _has_known_city(location_norm, set()):
+        return False
+    return _has_any(location_norm, _ANONYMOUS_LOCATION_KEYWORDS)
+
+
 # --- Residence restriction detection ---------------------------------------
 
 # Bounded surface forms for a bare "US", which is deliberately NOT a generic
@@ -417,10 +468,34 @@ _US_RESTRICTION_PATTERNS = (
     re.compile(r"\bremote\s*,\s*(?:us|u s|usa)\b"),
     re.compile(r"\b(?:us|u s|usa)\s+remote\b"),
     re.compile(r"\bremote\s+within\s+(?:the\s+)?(?:us|u s|usa)\b"),
-    re.compile(rf"\bremote\s+(?:only\s+)?(?:from\s+|in\s+|for\s+|at\s+)?(?:the\s+)?(?:us|u s|usa)\b"),
+    re.compile(
+        rf"\bremote\s+(?:only\s+)?(?:from\s+|in\s+|for\s+|at\s+)?(?:the\s+)?(?:us|u s|usa)\b"
+        rf"(?!\s*-?\s*(?:based\s+)?(?:companies|clients|firms|teams?|businesses|"
+        rf"organizations?|employers?|startups?|customers?|partners?|markets?)\b)"
+    ),
     re.compile(r"\bwithin\s+(?:the\s+)?(?:us|usa)\b"),
     re.compile(r"\b(?:us|u s|usa)\s+only\b"),
     re.compile(r"\bonly\s+(?:us|u s|usa)\b"),
+    # Candidate-directed "US-based candidates" requirement. Kept distinct from a
+    # descriptive third-party statement such as "us based companies" and from a
+    # soft preference such as "US-based candidates preferred".
+    re.compile(
+        r"\b(?:us|u s|usa)[\s-]*based\s+"
+        r"(?:candidates?|applicants?|developers?|employees?|residents?)\s+only\b"
+    ),
+    re.compile(
+        r"\bonly\s+(?:us|u s|usa)[\s-]*based\s+"
+        r"(?:candidates?|applicants?|developers?|employees?|residents?)\b"
+    ),
+    re.compile(
+        r"\b(?:candidates?|applicants?|developers?|employees?|residents?)\s+"
+        r"(?:must\s+)?(?:be\s+)?(?:based|located|residing|reside|live)\s+"
+        r"(?:in\s+)?(?:the\s+)?(?:us|u s|usa|united states)\b"
+    ),
+    re.compile(
+        r"\brequires?\s+you\s+to\s+be\s+(?:located|based|residing|reside)\s+in\s+"
+        r"(?:the\s+)?(?:us|u s|usa|united states)\b"
+    ),
     re.compile(
         rf"\b(?:must|should|need(?:s)?\s+to)\s+(?:reside|live|be\s+based)\s+in\s+"
         rf"(?:the\s+)?(?:us|u s|usa|united states)\b"
@@ -438,6 +513,8 @@ _EU_RESTRICTION_PATTERNS = (
     re.compile(r"\bwithin\s+(?:the\s+)?(?:eu|europe|european union)\b"),
     re.compile(r"\b(?:eu|europe|european union)\s+only\b"),
     re.compile(r"\bonly\s+(?:eu|europe|european union)\b"),
+    # Reversed order: "Europe - Remote", "Europe, Remote", "EMEA Remote".
+    re.compile(r"\b(?:eu|europe|european union)\b\s*[,/]?\s*remote\b"),
     re.compile(
         rf"\b(?:must|should|need(?:s)?\s+to)\s+(?:reside|live|be\s+based)\s+in\s+"
         rf"(?:the\s+)?(?:eu|europe|european union)\b"
@@ -453,6 +530,8 @@ _REGION_RESTRICTION_PATTERNS = (
     re.compile(r"\bwithin\s+(?:the\s+)?(?:emea|apac)\b"),
     re.compile(r"\b(?:emea|apac)\s+only\b"),
     re.compile(r"\bonly\s+(?:emea|apac)\b"),
+    # Reversed order: "EMEA - Remote", "APAC Remote".
+    re.compile(r"\b(?:emea|apac)\b\s*[,/]?\s*remote\b"),
 )
 
 _REGION_TO_COUNTRY = {
@@ -526,20 +605,27 @@ def _find_residence_restriction(text: str) -> Optional[str]:
     """
     Return the place named as a residence requirement, or None.
 
-    Explicit openness keywords do NOT suppress a restriction: the classify flow
-    gives an explicit residence requirement precedence over openness.
+    Explicit candidate-directed residence requirements win over openness, so the
+    classify flow never lets openness cancel them. Foreign region restrictions
+    (EU/EMEA/APAC) are skipped when the listing also names the candidate's
+    region (LATAM/Americas/...): that is an OR-list which already includes the
+    candidate.
     """
     if not text:
         return None
     for pattern in _US_RESTRICTION_PATTERNS:
         if pattern.search(text):
             return "United States"
-    for pattern in _EU_RESTRICTION_PATTERNS:
-        if pattern.search(text):
-            return "European Union"
-    for pattern in _REGION_RESTRICTION_PATTERNS:
-        if pattern.search(text):
-            return "EMEA" if "emea" in pattern.pattern else "APAC"
+    if not _has_any(text, _ALLOW_REGION_KEYWORDS):
+        for pattern in _EU_RESTRICTION_PATTERNS:
+            if pattern.search(text):
+                return "European Union"
+        for pattern in _REGION_RESTRICTION_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                # Attribute the region from the matched text, not the pattern
+                # source: the EMEA/APAC alternation appears in every pattern.
+                return "EMEA" if "emea" in match.group(0) else "APAC"
     for pattern in _RESTRICTION_PATTERNS:
         match = pattern.search(text)
         if match:
@@ -588,14 +674,16 @@ def classify_location(
     """
     Classify a listing as geographically eligible or blocked.
 
-    Precedence: work mode, then an explicit residence requirement (which wins
-    over any openness wording), then explicit openness to a region that includes
-    the candidate's country, then the location anchor as the conservative
-    default.
+    Precedence: work mode (see the module docstring for the strict work-mode
+    rules), then an explicit residence requirement (which wins over any openness
+    wording), then explicit openness to a region that includes the candidate's
+    country, then the location anchor as the conservative default. Openness is
+    consulted only inside the remote branch, so it can never influence the work
+    mode or rescue an on-site listing.
 
-    Remote detection is text-first. The JobSpy ``is_remote`` flag is unreliable
-    in production data (Barcelona listings arrive flagged remote), but it is
-    still accepted on its own when there is no location text, because several
+    The JobSpy ``is_remote`` flag is unreliable in production data (Barcelona
+    listings arrive flagged remote), so it is a weak hint only. It is still
+    accepted on its own when there is no location text, because several
     legitimate remote listings ship with an empty location.
     """
     loc_norm = _normalize(location)
@@ -609,23 +697,48 @@ def classify_location(
     candidate_aliases = _candidate_city_aliases(candidate_city)
     in_candidate_city = _detect_candidate_city(anchor, candidate_aliases)
 
-    # Work mode detection.
-    remote_text = (
-        _has_any(anchor, _REMOTE_KEYWORDS)
-        or _has_any(mod_norm, _REMOTE_KEYWORDS)
-        or _has_any(desc_norm, _REMOTE_KEYWORDS)
-    )
-    hybrid_text = _has_any(full, _HYBRID_KEYWORDS) or _has_any(mod_norm, _HYBRID_KEYWORDS)
-    onsite_text = _has_any(full, _ONSITE_KEYWORDS) or _has_any(mod_norm, _ONSITE_KEYWORDS)
+    # Work mode detection. Openness wording is intentionally absent from every
+    # signal here: only a modality, an explicit work-mode word, the weak
+    # is_remote flag, or an anonymous structured location can set the mode.
+    mod_remote = _has_any(mod_norm, _REMOTE_MODE_KEYWORDS)
+    mod_hybrid = _has_any(mod_norm, _HYBRID_KEYWORDS)
+    mod_onsite = _has_any(mod_norm, _ONSITE_KEYWORDS)
 
-    if hybrid_text:
+    explicit_remote = (
+        _has_any(anchor, _REMOTE_MODE_KEYWORDS)
+        or _has_any(desc_norm, _REMOTE_MODE_KEYWORDS)
+    )
+    explicit_hybrid = _has_any(full, _HYBRID_KEYWORDS)
+    explicit_onsite = _has_any(full, _ONSITE_KEYWORDS)
+    explicit_onsiteish = explicit_onsite or explicit_hybrid
+
+    modality_claims = int(mod_remote) + int(mod_hybrid) + int(mod_onsite)
+    if modality_claims > 1:
+        # Conflicting modality signals: fail closed into hybrid.
         work_mode = WorkMode.HYBRID
-    elif remote_text or is_remote:
+    elif mod_remote:
+        # Modality beats is_remote and openness; only explicit on-site text conflicts.
+        work_mode = WorkMode.HYBRID if explicit_onsiteish else WorkMode.REMOTE
+    elif mod_hybrid:
+        work_mode = WorkMode.HYBRID
+    elif mod_onsite:
+        work_mode = WorkMode.HYBRID if (explicit_remote or explicit_hybrid) else WorkMode.ONSITE
+    elif explicit_remote and explicit_onsiteish:
+        work_mode = WorkMode.HYBRID
+    elif explicit_hybrid:
+        work_mode = WorkMode.HYBRID
+    elif explicit_remote:
         work_mode = WorkMode.REMOTE
-    elif onsite_text:
+    elif explicit_onsite:
         work_mode = WorkMode.ONSITE
+    elif is_remote:
+        work_mode = WorkMode.REMOTE
     elif loc_norm and _has_known_city(loc_norm, candidate_aliases):
         work_mode = WorkMode.ONSITE
+    elif loc_norm and _is_anonymous_location(loc_norm):
+        # An anonymous structured location ("Anywhere"/"Worldwide") is
+        # location-agnostic work, which resolves through the remote branch.
+        work_mode = WorkMode.REMOTE
     else:
         work_mode = WorkMode.UNKNOWN
 
@@ -637,7 +750,13 @@ def classify_location(
         anchor_countries.extend(
             found for _, _, found in _detect_cities(anchor) if found not in anchor_countries
         )
-        country = anchor_countries[0] if anchor_countries else None
+        if len(anchor_countries) > 1 and candidate_country_name in anchor_countries:
+            # A list of countries that includes the candidate's is an open list,
+            # not a single foreign anchor. Descriptive third-party statements
+            # such as "located in Europe, Brazil, or Argentina" land here.
+            country = None
+        elif anchor_countries:
+            country = anchor_countries[0]
     arg_cities = [display for _, display in _detect_argentina_cities(anchor)]
     if country is None and arg_cities:
         country = "Argentina"
@@ -645,7 +764,6 @@ def classify_location(
     if in_candidate_city:
         city = "Mar del Plata"
 
-    openness = _has_openness(full)
     restriction = _find_residence_restriction(full)
     effective_country = country or restriction
     foreign_restriction = (
@@ -678,8 +796,8 @@ def classify_location(
             ),
         )
 
-    # 3. Candidate city: on-site, hybrid, and remote are all acceptable locally.
-    if in_candidate_city:
+    # 3. Candidate city, unless the location also resolves to a foreign country.
+    if in_candidate_city and not is_foreign:
         reason = REASON_REMOTE_OK if work_mode == WorkMode.REMOTE else REASON_ONSITE_CANDIDATE_CITY
         return LocationVerdict(
             eligible=True,
@@ -713,11 +831,12 @@ def classify_location(
             ),
         )
 
-    # 5. Foreign country anchored in the location. Explicit openness to a region
-    #    that includes Argentina overrides the foreign anchor for remote roles.
+    # 5. Foreign country anchored in the location. This is the ONLY place where
+    #    openness is consulted, and only for remote roles, so openness can never
+    #    influence the work mode or rescue an on-site listing.
     if is_foreign:
         if work_mode == WorkMode.REMOTE:
-            if openness:
+            if _has_openness(full):
                 return LocationVerdict(
                     eligible=True,
                     reason=REASON_REMOTE_OK,

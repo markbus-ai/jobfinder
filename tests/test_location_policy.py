@@ -7,8 +7,6 @@ they need no project dependencies, no network access, and no API keys.
 The cases marked "production" mirror real rows from the live database.
 """
 
-import inspect
-
 import pytest
 
 from services.LocationPolicy import (
@@ -169,12 +167,19 @@ def test_remote_disabled_blocks_remote_jobs():
 
 
 def test_foreign_remotes_allowed_when_policy_disabled():
-    verdict = classify_location(
+    # The same restricted listing is blocked while enforcement is on...
+    blocked = classify_location(location="Remote - Spain")
+    assert blocked.eligible is False
+    assert blocked.reason == REASON_REMOTE_FOREIGN_RESTRICTED
+    assert blocked.country == "Spain"
+    # ...and only the explicit opt-out lets it through.
+    allowed = classify_location(
         location="Remote - Spain",
         block_foreign_restricted_remote=False,
     )
-    assert verdict.eligible is True
-    assert verdict.reason == REASON_REMOTE_OK
+    assert allowed.eligible is True
+    assert allowed.reason == REASON_REMOTE_OK
+    assert allowed.country == "Spain"
 
 
 def test_uncorroborated_remote_flag_on_foreign_location_is_blocked():
@@ -209,14 +214,15 @@ class TestNotificationGate:
     def test_eligible_below_threshold_does_not_notify(self):
         assert is_notifiable(location_eligible=True, match_score=69) is False
 
-    def test_notification_gate_has_no_is_suitable_bypass(self):
-        # The gate exposes exactly these parameters: reintroducing is_suitable
-        # as a bypass would change the signature and fail this assertion.
-        params = list(inspect.signature(is_notifiable).parameters)
-        assert params == ["location_eligible", "match_score", "min_match_score"]
-        # The threshold is honored, not silently ignored.
-        assert is_notifiable(location_eligible=True, match_score=69, min_match_score=70) is False
-        assert is_notifiable(location_eligible=True, match_score=70, min_match_score=70) is True
+    def test_notification_gate_rejects_is_suitable_bypass(self):
+        # A reintroduced is_suitable bypass would make this call legal and fail
+        # the test instead of silently overriding the threshold.
+        with pytest.raises(TypeError):
+            is_notifiable(location_eligible=True, match_score=100, is_suitable=True)
+        # The default threshold is honored, not ignored.
+        assert is_notifiable(location_eligible=True, match_score=69) is False
+        assert is_notifiable(location_eligible=True, match_score=70) is True
+        assert is_notifiable(location_eligible=True, match_score=100, min_match_score=101) is False
 
     def test_custom_threshold(self):
         assert is_notifiable(location_eligible=True, match_score=60, min_match_score=60) is True
@@ -310,20 +316,23 @@ def test_toluca_remote_is_blocked_as_foreign():
 
 
 @pytest.mark.parametrize(
-    "text,forbidden_country",
+    "text,expected_country",
     [
-        ("Indianapolis", "United States"),
-        ("Ukulele", "United Kingdom"),
-        ("Leonardo", "Mexico"),
-        ("California", "United States"),
-        ("join us", "United States"),
+        ("Indianapolis", None),
+        ("Ukulele", None),
+        ("Leonardo", None),
+        ("California", None),
+        ("join us", None),
+        # F2: descriptive third-party mentions must not become a country anchor.
+        ("us based companies", None),
+        ("located in europe, brazil, or argentina", None),
     ],
 )
-def test_country_words_inside_other_words_do_not_match(text, forbidden_country):
+def test_country_words_inside_other_words_do_not_match(text, expected_country):
     verdict = classify_location(location="Remote", title=text)
     assert verdict.eligible is True
     assert verdict.reason == REASON_REMOTE_OK
-    assert verdict.country != forbidden_country
+    assert verdict.country == expected_country
 
 
 def test_argentina_city_detection_is_functional():
@@ -338,3 +347,174 @@ def test_remote_flag_alone_on_empty_location_is_accepted():
     assert verdict.eligible is True
     assert verdict.reason == REASON_REMOTE_OK
     assert verdict.work_mode == "remote"
+
+
+# --- Final bounded correction: work mode, openness, anchors -----------------
+# The cases below use the exact strings from the correction brief.
+
+@pytest.mark.parametrize(
+    "location,modality,title,description",
+    [
+        ("Barcelona, Spain", "onsite", "Worldwide LATAM Sales Manager", ""),
+        ("Barcelona, Spain", "onsite", "On-site Sales Manager", "We are a worldwide team"),
+        ("Barcelona, Spain", "onsite", "", "Remote-first culture"),
+        ("Madrid, Spain", "presencial", "LATAM Manager", "worldwide company"),
+        ("Madrid, Spain", "onsite", "Global Operations Lead", "We operate worldwide"),
+    ],
+)
+def test_explicit_modality_onsite_is_not_flipped_by_openness(
+    location, modality, title, description
+):
+    # F1: openness wording must never turn an on-site foreign listing remote.
+    verdict = classify_location(
+        location=location, modality=modality, title=title, description=description
+    )
+    assert verdict.eligible is False
+    assert verdict.reason == REASON_ONSITE_FOREIGN
+    assert verdict.work_mode in ("onsite", "hybrid")
+
+
+@pytest.mark.parametrize(
+    "openness_word",
+    ["worldwide", "anywhere", "global", "international", "LATAM", "Americas"],
+)
+@pytest.mark.parametrize("field", ["title", "description"])
+def test_openness_never_sets_work_mode(field, openness_word):
+    payload = {"location": "Barcelona, Spain", "modality": "onsite", field: openness_word}
+    verdict = classify_location(**payload)
+    assert verdict.eligible is False
+    assert verdict.reason == REASON_ONSITE_FOREIGN
+
+
+def test_openness_in_title_does_not_set_work_mode_without_modality():
+    # A known foreign city with no modality is still on-site, never remote.
+    verdict = classify_location(location="Barcelona, Spain", title="Worldwide Sales Manager")
+    assert verdict.eligible is False
+    assert verdict.reason == REASON_ONSITE_FOREIGN
+
+
+def test_explicit_modality_onsite_beats_is_remote_flag():
+    verdict = classify_location(location="Barcelona, Spain", modality="onsite", is_remote=True)
+    assert verdict.eligible is False
+    assert verdict.reason == REASON_ONSITE_FOREIGN
+    assert verdict.work_mode == "onsite"
+
+
+def test_explicit_modality_onsite_beats_openness_wording():
+    verdict = classify_location(
+        location="Barcelona, Spain",
+        modality="onsite",
+        is_remote=True,
+        title="Worldwide",
+        description="Global international team",
+    )
+    assert verdict.eligible is False
+    assert verdict.reason == REASON_ONSITE_FOREIGN
+    assert verdict.work_mode == "onsite"
+
+
+@pytest.mark.parametrize(
+    "location,description",
+    [
+        ("Remote", "Must be based in the US. We are a worldwide team."),
+        ("Remote", "US only. Join our international team."),
+        ("Remote", "Only candidates residing in Spain. We are global."),
+        ("Remote", "Candidates must be based in Mexico. We are a global company."),
+        ("Remote", "Open worldwide, but you must be based in Poland."),
+        ("Remote", "We are global. Must reside in Spain."),
+        ("Remote", "US-based candidates only."),
+        ("Remote", "Only US based candidates will be considered."),
+    ],
+)
+def test_candidate_directed_requirements_still_block(location, description):
+    verdict = classify_location(location=location, description=description)
+    assert verdict.eligible is False
+    assert verdict.reason == REASON_REMOTE_FOREIGN_RESTRICTED
+
+
+@pytest.mark.parametrize(
+    "location,title,description",
+    [
+        ("Remote", "us based companies", ""),
+        ("Remote", "", "our clients are based in the US"),
+        ("Remote", "", "our team is located in Europe"),
+        ("Remote", "located in europe, brazil, or argentina", ""),
+    ],
+)
+def test_descriptive_third_party_statements_do_not_block(location, title, description):
+    # F2: descriptions about third parties are not residence requirements.
+    verdict = classify_location(location=location, title=title, description=description)
+    assert verdict.eligible is True
+    assert verdict.reason == REASON_REMOTE_OK
+
+
+def test_soft_us_preference_does_not_block():
+    # "preferred" is a preference, not a candidate-directed requirement.
+    verdict = classify_location(
+        location="Remote - Americas", title="US-based candidates preferred"
+    )
+    assert verdict.eligible is True
+    assert verdict.reason == REASON_REMOTE_OK
+
+
+@pytest.mark.parametrize(
+    "location,expected_country",
+    [
+        ("Europe - Remote", "European Union"),
+        ("Europe, Remote", "European Union"),
+        ("EMEA - Remote", "EMEA"),
+        ("APAC Remote", "APAC"),
+        ("Remote - Europe", "European Union"),
+    ],
+)
+def test_region_restriction_in_either_order_blocks(location, expected_country):
+    # F3: the region restriction must be recognized before or after "remote".
+    verdict = classify_location(location=location)
+    assert verdict.eligible is False
+    assert verdict.reason == REASON_REMOTE_FOREIGN_RESTRICTED
+    assert verdict.country == expected_country
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["Remote - Americas", "LATAM / Europe - Remote", "Remote - LATAM"],
+)
+def test_allow_regions_stay_eligible(location):
+    # F3: an OR-list that includes the candidate's region stays eligible.
+    verdict = classify_location(location=location)
+    assert verdict.eligible is True
+    assert verdict.reason == REASON_REMOTE_OK
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "Spain, Mar del Plata",
+        "Barcelona, Mar del Plata",
+        "Mar del Plata, Spain",
+        "Madrid, Spain, General Pueyrredon",
+    ],
+)
+def test_foreign_country_beats_candidate_city(location):
+    # F4: a foreign country in the location must not allow an on-site job.
+    verdict = classify_location(location=location, modality="onsite")
+    assert verdict.eligible is False
+    assert verdict.reason == REASON_ONSITE_FOREIGN
+    assert verdict.country == "Spain"
+
+
+@pytest.mark.parametrize(
+    "location,expected_country",
+    [
+        ("US Remote", "United States"),
+        ("Remote (US)", "United States"),
+        ("Remote, US", "United States"),
+        ("Remote within the US", "United States"),
+        ("Remote - US", "United States"),
+    ],
+)
+def test_us_remote_forms_are_blocked(location, expected_country):
+    verdict = classify_location(location=location)
+    assert verdict.eligible is False
+    assert verdict.reason == REASON_REMOTE_FOREIGN_RESTRICTED
+    assert verdict.country == expected_country
