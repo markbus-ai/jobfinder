@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -16,9 +16,22 @@ from services.JobServices import JobService
 from services.GetOnBoardService import GetOnBoardService
 from services.GroqService import ai_service, SCORING_PROFILE
 from services.RedisServices import MemoryQueue
-from services.CVGenerator import generate_cv, generate_custom_typst, classify_job
+from services.CVGenerator import generate_cv, generate_custom_typst
 from services.EmailService import EmailService
 from services.LocationPolicy import classify_location, is_notifiable
+from services.AnalysisRetry import (
+    TransientAnalysisError,
+    cap_analysis_attempts,
+    retry_after_sleep,
+    should_reanalyze,
+)
+from services.EnglishPolicy import (
+    ENGLISH_LEVELS,
+    english_allowed,
+    is_notifiable_with_stored_english,
+    normalize_level,
+)
+from services.SearchPlanner import build_scrape_plan, parse_csv, summarize_plan
 
 # Logging configuration
 logging.basicConfig(
@@ -29,6 +42,116 @@ logger = logging.getLogger(__name__)
 # In-memory store for jobs with emails (for button callbacks)
 # Key: job_id, Value: dict with company, email, cv_path, profile
 jobs_with_email: Dict[str, Dict[str, Any]] = {}
+
+# Telegram display labels for the English level, keyed by the single-source
+# vocabulary. Completeness is asserted below, so adding a level without a label
+# fails at import time instead of silently dropping the label.
+_ENGLISH_LEVEL_DISPLAY: dict[str, str] = {
+    "none": "No requerido",
+    "basic": "Básico",
+    "intermediate": "Intermedio",
+    "fluent": "Fluido",
+}
+assert set(_ENGLISH_LEVEL_DISPLAY) == set(ENGLISH_LEVELS), (
+    "Every English level needs a Telegram display label; add the missing "
+    "level(s) to _ENGLISH_LEVEL_DISPLAY."
+)
+ENGLISH_LEVEL_LABELS = dict(_ENGLISH_LEVEL_DISPLAY)
+
+
+def _refresh_scraped_fields(target: Job, source: Job) -> Job:
+    """
+    Copy freshly scraped fields onto an existing persisted row (retry path).
+
+    The row is re-analyzed in place because inserting a new object with the same
+    primary key would violate the URL uniqueness constraint. Platform metadata
+    is only overwritten when the new scrape actually provides it.
+    """
+    for field in ("title", "company", "location", "url", "description", "salary",
+                  "is_remote", "source_platform"):
+        setattr(target, field, getattr(source, field))
+    for field in ("seniority", "modality", "tags"):
+        value = getattr(source, field)
+        if value is not None:
+            setattr(target, field, value)
+    return target
+
+
+def _notification_payload(
+    job: Job,
+    *,
+    cv_generated: bool,
+    cv_path: Optional[str],
+    company_email: Optional[str],
+) -> Dict[str, Any]:
+    """Build the message payload the Telegram worker consumes from a Job row."""
+    return {
+        "id": job.id,
+        "title": job.title,
+        "company": job.company,
+        "location": job.location,
+        "match_score": job.ai_match_score,
+        "summary": job.ai_summary,
+        "url": job.url,
+        "missing_skills": json.loads(job.missing_skills) if job.missing_skills else [],
+        "seniority_mismatch": job.seniority_mismatch,
+        "is_suitable": job.is_suitable,
+        "english_required": job.english_required,
+        "recommended_profile": job.recommended_profile,
+        "cv_generated": cv_generated,
+        "cv_path": cv_path,
+        "company_email": company_email,
+    }
+
+
+def _release_english_withheld(
+    job: Job,
+    session: Session,
+    notifications: list[Dict[str, Any]],
+) -> bool:
+    """
+    Notify a stored row that was withheld only by the English ceiling.
+
+    This is deliberately TOKEN-FREE: it decides from persisted values and never
+    calls the AI, so raising MAX_ENGLISH_LEVEL is retroactive at zero cost. Do
+    not "optimize" it back into a re-analysis -- that would spend one Groq
+    request per previously-withheld row, which is exactly what this path avoids.
+
+    Returns True when the row was released.
+    """
+    if not is_notifiable_with_stored_english(
+        location_eligible=job.location_eligible,
+        match_score=job.ai_match_score,
+        notified=job.notified,
+        analysis_failed=job.analysis_failed,
+        english_required=job.english_required,
+        min_match_score=settings.MIN_MATCH_SCORE,
+        max_english_level=settings.MAX_ENGLISH_LEVEL,
+    ):
+        return False
+
+    job.notified = True
+    # UX note: this token-free release path always reports cv_generated from the
+    # stored row and no company email, so the message renders "CV: X | Sin email"
+    # with no Auto-postular button. That is intentional, not a bug: generating a CV
+    # or extracting an email here would cost one Groq request per released row,
+    # which is exactly what this path exists to avoid.
+    notifications.append(
+        _notification_payload(
+            job,
+            cv_generated=bool(job.cv_generated),
+            cv_path=job.cv_path,
+            company_email=None,
+        )
+    )
+    session.add(job)
+    session.commit()
+    logger.info(
+        f"Released previously withheld job {job.title} @ {job.company}: stored "
+        f"English level '{job.english_required}' now fits "
+        f"MAX_ENGLISH_LEVEL='{settings.MAX_ENGLISH_LEVEL}' (no AI call)."
+    )
+    return True
 
 
 def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardService, email_service: EmailService):
@@ -42,49 +165,64 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
     6. Saves results to DB
     7. Returns list of notifications
     """
-    search_terms = [t.strip() for t in settings.SEARCH_TERMS.split(",") if t.strip()]
+    search_terms = parse_csv(settings.SEARCH_TERMS)
+    remote_terms = parse_csv(settings.SEARCH_TERMS_REMOTE)
+    remote_locations = parse_csv(settings.REMOTE_SEARCH_LOCATIONS)
     sources = [s.strip().lower() for s in settings.SEARCH_SOURCES.split(",") if s.strip()]
 
-    logger.info("🔎 Starting job scraping...")
+    # JobSpy per-country targets. Each country token drives the Indeed domain.
+    search_locations = [
+        ("Argentina", "argentina"),
+        ("Spain", "spain"),
+        ("Mexico", "mexico"),
+        ("Colombia", "colombia"),
+        ("Chile", "chile"),
+        ("Uruguay", "uruguay"),
+    ]
+
+    plan = build_scrape_plan(
+        search_terms=search_terms,
+        sources=sources,
+        jobspy_locations=search_locations,
+        getonboard_enabled=settings.GETONBOARD_ENABLED,
+        remote_enabled=settings.REMOTE_SEARCH_ENABLED,
+        remote_terms=remote_terms,
+        remote_locations=remote_locations,
+    )
+    counts = summarize_plan(plan)
+    logger.info(
+        f"🔎 Starting job scraping: {counts['total']} searches this cycle "
+        f"(getonboard={counts['getonboard']}, jobspy={counts['jobspy']}, remote={counts['remote']})."
+    )
 
     all_jobs = []
 
-    # --- GetOnBoard (LATAM public API, no auth needed) ---
-    if settings.GETONBOARD_ENABLED and "getonboard" in sources:
-        for term in search_terms:
-            try:
-                logger.info(f"🌎 Searching '{term}' on GetOnBoard...")
-                gob_jobs = getonboard_service.get_latest_jobs(term=term)
-                all_jobs.extend(gob_jobs)
-            except Exception as e:
-                logger.error(f"❌ Error searching '{term}' on GetOnBoard: {e}")
-        time.sleep(2)
-
-    # --- JobSpy: LinkedIn, Indeed, Google (per-country) ---
-    jobspy_sources = [s for s in sources if s != "getonboard"]
-    if jobspy_sources:
-        search_locations = [
-            {"loc": "Argentina", "country": "argentina"},
-            {"loc": "Spain", "country": "spain"},
-            {"loc": "Mexico", "country": "mexico"},
-            {"loc": "Colombia", "country": "colombia"},
-            {"loc": "Chile", "country": "chile"},
-            {"loc": "Uruguay", "country": "uruguay"},
-        ]
-
-        for target in search_locations:
-            for term in search_terms:
-                try:
-                    logger.info(f"🔎 Searching '{term}' in {target['loc']}...")
-                    jobs = job_service.get_latest_jobs(
-                        term=term,
-                        location=target["loc"],
-                        country=target["country"],
-                        limit=15,
+    for index, search in enumerate(plan):
+        try:
+            if search.source == "getonboard":
+                logger.info(f"🌎 Searching '{search.term}' on GetOnBoard...")
+                all_jobs.extend(getonboard_service.get_latest_jobs(term=search.term))
+            else:
+                mode = "remote" if search.is_remote else "local"
+                logger.info(f"🔎 Searching '{search.term}' in {search.location} ({mode})...")
+                all_jobs.extend(
+                    job_service.get_latest_jobs(
+                        term=search.term,
+                        location=search.location,
+                        country=search.country,
+                        limit=search.limit,
+                        is_remote=search.is_remote,
                     )
-                    all_jobs.extend(jobs)
-                except Exception as e:
-                    logger.error(f"❌ Error searching in {target['loc']}: {e}")
+                )
+        except Exception as e:
+            logger.error(f"❌ Error searching '{search.term}' in {search.location or 'getonboard'}: {e}")
+
+        # Preserve the original pacing: brief pause between source/location groups.
+        next_search = plan[index + 1] if index + 1 < len(plan) else None
+        if next_search is not None and (
+            next_search.source != search.source
+            or (search.source == "jobspy" and next_search.location != search.location)
+        ):
             time.sleep(2)
 
     # Deduplicate by ID (URL)
@@ -95,12 +233,26 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
 
     notifications = []
 
+    # Config may lower the retry budget but never raise it past the hard cap.
+    max_analysis_attempts = cap_analysis_attempts(settings.MAX_ANALYSIS_ATTEMPTS)
+
     with Session(engine) as session:
         for job in scraped_jobs:
-            # Skip if already exists (deduplication by URL)
+            # Deduplicate by URL. A transiently failed row with attempts left is
+            # re-analyzed in place; healthy or exhausted rows are skipped.
             existing_job = session.get(Job, job.id)
-            if existing_job:
-                continue
+            if existing_job is not None:
+                if not should_reanalyze(
+                    existing_job.analysis_failed,
+                    existing_job.analysis_attempts,
+                    max_analysis_attempts,
+                ):
+                    # A stored row skipped by dedup may still be releasable if
+                    # MAX_ENGLISH_LEVEL was raised after it was withheld. That
+                    # check is token-free (stored values only), never a re-analysis.
+                    _release_english_withheld(existing_job, session, notifications)
+                    continue
+                job = _refresh_scraped_fields(existing_job, job)
 
             # --- Location policy gate: runs BEFORE any AI call to save tokens ---
             verdict = classify_location(
@@ -132,8 +284,32 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
             logger.info(f"🤖 Analyzing: {job.title} @ {job.company}")
 
             # AI analysis (with rate limiting)
-            audit = ai_service.analyze_job(job, SCORING_PROFILE)
-            
+            try:
+                audit = ai_service.analyze_job(job, SCORING_PROFILE)
+            except TransientAnalysisError as e:
+                # A rate limit / network blip must never be frozen as a 0/100.
+                job.analysis_attempts = (job.analysis_attempts or 0) + 1
+                job.analysis_failed = True
+                if job.analysis_attempts >= max_analysis_attempts:
+                    # Exhausted: persist a permanent 0 so it never loops forever.
+                    job.ai_match_score = 0
+                    job.ai_summary = f"Analysis failed after {job.analysis_attempts} attempts"
+                    job.is_suitable = False
+                    job.missing_skills = json.dumps(["Analysis failed: transient error"])
+                logger.warning(
+                    f"Transient AI failure for {job.title} @ {job.company} "
+                    f"(attempt {job.analysis_attempts}/{max_analysis_attempts}, "
+                    f"status={e.status_code or 'n/a'}, "
+                    f"retry_after={e.retry_after if e.retry_after is not None else 'n/a'}); "
+                    f"not notifying, retrying later."
+                )
+                session.add(job)
+                session.commit()
+                # Honor Retry-After so the next job in this cycle does not hammer
+                # a rate-limited API. Capped by retry_after_sleep.
+                time.sleep(retry_after_sleep(e.retry_after))
+                continue
+
             # Small delay between API calls to respect rate limits
             time.sleep(0.5)
 
@@ -150,6 +326,10 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                 f"   🌍 AI location: mode={audit.work_mode} country={audit.job_country or 'n/a'} "
                 f"city={audit.job_city or 'n/a'} residence_required={audit.requires_residence_in or 'none'}"
             )
+            logger.info(
+                f"   English: required={audit.english_required} "
+                f"evidence={audit.english_evidence or 'n/a'}"
+            )
 
             # Update model fields from audit
             job.ai_match_score = audit.match_score
@@ -158,13 +338,34 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
             job.seniority_mismatch = audit.seniority_mismatch
             job.recommended_profile = audit.recommended_profile
             job.missing_skills = json.dumps(audit.missing_skills) if audit.missing_skills else "[]"
+            job.english_required = audit.english_required
+            job.english_evidence = audit.english_evidence
+            job.analysis_failed = False
+
+            # Notification gate: location + score + English ceiling. The English
+            # level only exists after the AI call, so it is applied here and not
+            # in the location gate (which runs before any AI call).
+            notifiable = is_notifiable(
+                job.location_eligible, job.ai_match_score, settings.MIN_MATCH_SCORE
+            ) and english_allowed(job.english_required, settings.MAX_ENGLISH_LEVEL)
+            if not notifiable and job.ai_match_score is not None and job.ai_match_score >= settings.MIN_MATCH_SCORE:
+                if normalize_level(job.english_required) is None:
+                    logger.info(
+                        f"   Withheld: English level missing or outside the closed "
+                        f"vocabulary (english_required={job.english_required!r}); failing closed."
+                    )
+                else:
+                    logger.info(
+                        f"   Withheld: English level '{job.english_required}' exceeds "
+                        f"MAX_ENGLISH_LEVEL='{settings.MAX_ENGLISH_LEVEL}'."
+                    )
 
             # --- CV Generation for suitable jobs ---
             cv_generated = False
             cv_path = None
             company_email = None
 
-            if is_notifiable(job.location_eligible, job.ai_match_score, settings.MIN_MATCH_SCORE):
+            if notifiable:
                 # 1. Generate customized CV content via Groq
                 try:
                     cv_content = ai_service.generate_cv_content(job, audit)
@@ -197,7 +398,7 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                     logger.info(f"   📧 Email found: {company_email}")
 
             # --- Notification ---
-            if is_notifiable(job.location_eligible, job.ai_match_score, settings.MIN_MATCH_SCORE) and not job.notified:
+            if notifiable and not job.notified:
                 # Mark as notified first
                 job.notified = True
 
@@ -210,22 +411,14 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                         "profile": audit.recommended_profile,
                     }
 
-                notifications.append({
-                    "id": job.id,
-                    "title": job.title,
-                    "company": job.company,
-                    "location": job.location,
-                    "match_score": job.ai_match_score,
-                    "summary": job.ai_summary,
-                    "url": job.url,
-                    "missing_skills": json.loads(job.missing_skills) if job.missing_skills else [],
-                    "seniority_mismatch": job.seniority_mismatch,
-                    "is_suitable": job.is_suitable,
-                    "recommended_profile": audit.recommended_profile,
-                    "cv_generated": cv_generated,
-                    "cv_path": cv_path,
-                    "company_email": company_email,
-                })
+                notifications.append(
+                    _notification_payload(
+                        job,
+                        cv_generated=cv_generated,
+                        cv_path=cv_path,
+                        company_email=company_email,
+                    )
+                )
 
             # Single commit per job — save all state at once
             session.add(job)
@@ -276,12 +469,18 @@ async def scraper_scheduler(queue: MemoryQueue):
                         company_email = job_data.get('company_email')
                         email_status = f"📧 {company_email}" if company_email else "📧 Sin email"
 
+                        # English level required by the listing
+                        english_level = ENGLISH_LEVEL_LABELS.get(
+                            job_data.get('english_required'), job_data.get('english_required') or "n/a"
+                        )
+
                         msg_text = (
                             f"🚀 <b>{suitability_icon} {job_data['match_score']}/100</b>\n\n"
                             f"🏢 <b>{job_data['company']}</b>\n"
                             f"💼 {job_data['title']}\n"
                             f"📍 {job_data['location']}\n\n"
                             f"📋 {profile_label}\n"
+                            f"Inglés: {english_level}\n"
                             f"📉 Skills: <i>{skills_text}</i>"
                             f"{seniority_alert}\n\n"
                             f"📝 {job_data['summary']}\n\n"

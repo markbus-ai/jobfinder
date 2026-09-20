@@ -2,10 +2,18 @@ import json
 import logging
 import instructor
 from groq import Groq
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Dict, Any, Optional
 from core.config import settings
 from models.JobModels import Job
+from services.AnalysisRetry import (
+    TransientAnalysisError,
+    compute_backoff,
+    extract_retry_after,
+    extract_status_code,
+    is_transient_exception,
+)
+from services.EnglishPolicy import ENGLISH_LEVELS, EnglishLevelLiteral, normalize_level
 
 
 # --- Candidate Profile (REAL data — never fabricated) ---
@@ -206,6 +214,72 @@ SCORING_PROFILE = {
 }
 
 
+# Both the response schema and the prompt derive their vocabulary from
+# services.EnglishPolicy.ENGLISH_LEVELS, the single source of truth. Rendering
+# it here keeps the model from ever being told a level the gate does not know.
+_QUOTED_ENGLISH_LEVELS = ", ".join(f"'{level}'" for level in ENGLISH_LEVELS)
+
+# The single 'fluent' definition, reused verbatim by the response schema and by
+# rule 11 so the two can never drift into divergent meanings. 'fluent' requires
+# explicit evidence of SPOKEN English. A listing merely WRITTEN in English does
+# NOT qualify: many LATAM/remote listings are written in English without
+# requiring spoken English, so they are at most 'intermediate'.
+_FLUENT_DEFINITION = (
+    "day-to-day spoken English backed by explicit evidence: meetings or daily "
+    "syncs with English-speaking clients or teams, an explicit 'fluent English "
+    "required', or interviews conducted in English; a listing that is merely "
+    "WRITTEN in English is at most 'intermediate', never 'fluent'"
+)
+
+# Silence must map to 'intermediate', NEVER to null. The real corpus is
+# overwhelmingly silent about English (98.8% of listings), and a null answer is
+# withheld fail-closed in code, which would keep every otherwise-good match out
+# of the notification pipeline. This sentence is load-bearing; the tests assert
+# it stays in the field description.
+_ENGLISH_SILENCE_RULE = (
+    "Most listings say nothing about English and silence is not a requirement: "
+    "when the listing does not mention English, default to 'intermediate'. Never "
+    "answer null for silence; reserve null for nothing and always answer one of "
+    "the four levels."
+)
+
+# Meaning of each closed-vocabulary level, keyed by level so a new level cannot
+# be added without a meaning (completeness is asserted at import time below).
+_ENGLISH_LEVEL_MEANINGS: dict[str, str] = {
+    "none": "no English needed (listing is fully in Spanish/Portuguese or states no language requirement)",
+    "basic": "only reading simple English docs or occasional English terms",
+    "intermediate": "can read/write technical English and join occasional English meetings",
+    "fluent": _FLUENT_DEFINITION,
+}
+assert set(_ENGLISH_LEVEL_MEANINGS) == set(ENGLISH_LEVELS), (
+    "Every English level needs a meaning; add the missing level(s) to "
+    "_ENGLISH_LEVEL_MEANINGS."
+)
+
+_ENGLISH_REQUIRED_DESCRIPTION = (
+    "English level the listing requires, judged ONLY from the listing text. One of "
+    + "; ".join(
+        f"'{level}' = {_ENGLISH_LEVEL_MEANINGS[level]}"
+        for level in ENGLISH_LEVELS
+    )
+    + ". "
+    + _ENGLISH_SILENCE_RULE
+    + " 'English is a plus' is at most 'intermediate'."
+)
+
+# Rule 11 of the analysis system prompt. The silence sentence is load-bearing:
+# without it the model guesses 'fluent' (or answers null) more often, which the
+# gate then withholds. It reuses the same fluent and silence definitions as the
+# field description above.
+ENGLISH_LEVEL_PROMPT = (
+    "11. ENGLISH LEVEL: Judge 'english_required' from the listing text only, using the "
+    f"closed vocabulary {_QUOTED_ENGLISH_LEVELS}. Use 'fluent' only for "
+    f"{_FLUENT_DEFINITION}. 'English is a plus' is at most 'intermediate'. "
+    f"{_ENGLISH_SILENCE_RULE} Quote the justifying text in 'english_evidence', or "
+    "leave it empty when the listing says nothing."
+)
+
+
 class JobAudit(BaseModel):
     """AI-generated audit of job-candidate fit."""
 
@@ -248,6 +322,32 @@ class JobAudit(BaseModel):
             "Must be a plain country/region name only, never free prose. Empty string when none."
         ),
     )
+    english_required: Optional[EnglishLevelLiteral] = Field(
+        default=None,
+        description=_ENGLISH_REQUIRED_DESCRIPTION,
+    )
+    english_evidence: str = Field(
+        default="",
+        description=(
+            "Short quote from the listing that justifies english_required "
+            "(e.g. 'fluent English required', 'English is a plus'). Empty string when the "
+            "listing says nothing about English."
+        ),
+    )
+
+    @field_validator("english_required", mode="before")
+    @classmethod
+    def _coerce_english_required(cls, value: object) -> Optional[str]:
+        """
+        Map anything outside the closed vocabulary to ``None``.
+
+        The model is asked for a fixed vocabulary, but a non-compliant answer
+        ('C1', 'fluent English', a stray number) must neither crash the analysis
+        nor slip past the gate. Normalizing to ``None`` keeps the failure closed
+        and auditable: ``english_allowed(None, ...)`` withholds the row.
+        """
+        normalized = normalize_level(value)
+        return None if normalized is None else normalized.value
 
 
 class CVContent(BaseModel):
@@ -262,7 +362,7 @@ class CVContent(BaseModel):
 
 
 class AIService:
-    def __init__(self, api_key: str = settings.GROQ_API_KEY, model: str = settings.GROQ_MODEL):
+    def __init__(self, api_key: str = settings.GROQ_API_KEY, model: str = settings.GROQ_MODEL, sleep=None):
         # Support key rotation: GROQ_API_KEYS (comma-separated) or single GROQ_API_KEY
         self._keys = []
         if settings.GROQ_API_KEYS:
@@ -277,6 +377,7 @@ class AIService:
         # Rate limit tracking per key: {key_index: [timestamps]}
         import time
         self._time = time
+        self._sleep = sleep if sleep is not None else time.sleep
         self._request_times: Dict[int, list] = {i: [] for i in range(len(self._keys))}
         self._MIN_DELAY = 0.5  # Min seconds between requests per key
         self._MAX_RPM_PER_KEY = 28  # Stay under 30 RPM limit
@@ -345,10 +446,15 @@ class AIService:
                 job_country="",
                 job_city="",
                 requires_residence_in="",
+                english_required=None,
+                english_evidence="",
             )
 
-        max_retries = len(self._keys) * 2  # Try each key up to 2 times
+        max_retries = max(len(self._keys) * 2, 1)  # Try each key up to 2 times
         last_error = None
+        last_transient = False
+        last_retry_after = None
+        last_status_code = None
         
         for attempt in range(max_retries):
             try:
@@ -414,7 +520,8 @@ class AIService:
                                 "(e.g., 'programming', 'web development').\n"
                                 "10. MISSING DATA: If the candidate profile is missing, empty, or does not allow you "
                                 "to verify the required stack, return match_score = 0 and is_suitable = false. Never "
-                                "guess or default to a confident score."
+                                "guess or default to a confident score.\n"
+                                f"{ENGLISH_LEVEL_PROMPT}"
                             ),
                         },
                         {
@@ -431,10 +538,29 @@ class AIService:
                 return audit
             except Exception as e:
                 last_error = e
-                logging.getLogger(__name__).warning(f"Groq key #{self._key_index + 1} failed: {e}")
+                last_transient = is_transient_exception(e)
+                last_retry_after = extract_retry_after(e)
+                last_status_code = extract_status_code(e)
+                kind = "transient" if last_transient else "permanent"
+                logging.getLogger(__name__).warning(
+                    f"Groq key #{self._key_index + 1} failed ({kind}): {e}"
+                )
                 if attempt < max_retries - 1:
+                    if last_transient:
+                        # Honor Retry-After when provided; otherwise bounded backoff.
+                        delay = compute_backoff(attempt, last_retry_after)
+                        self._sleep(delay)
                     self._rotate_key()
-        
+
+        # A transient failure must not be turned into a permanent score: signal
+        # the caller so it can persist a retryable row instead of a fake 0/100.
+        if last_transient:
+            raise TransientAnalysisError(
+                f"Transient analysis failure: {str(last_error)[:150]}",
+                status_code=last_status_code,
+                retry_after=last_retry_after,
+            )
+
         return JobAudit(
             match_score=0,
             is_suitable=False,
@@ -443,6 +569,8 @@ class AIService:
             short_verdict=f"Error técnico: {str(last_error)[:50]}",
             recommended_profile="backend",
             key_requirements=[],
+            english_required=None,
+            english_evidence="",
         )
 
     def generate_cv_content(self, job: Job, audit: JobAudit) -> CVContent:
@@ -450,7 +578,7 @@ class AIService:
         Generate customized CV content for a specific job using Groq.
         Rotates API keys on failure and respects rate limits.
         """
-        max_retries = len(self._keys) * 2  # Try each key up to 2 times
+        max_retries = max(len(self._keys) * 2, 1)  # Try each key up to 2 times
         last_error = None
         
         for attempt in range(max_retries):
