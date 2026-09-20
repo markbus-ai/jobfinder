@@ -53,6 +53,9 @@ class Settings(BaseModel):
     # Notification threshold (technical match score, 0-100)
     MIN_MATCH_SCORE: int = int(os.getenv("MIN_MATCH_SCORE", "70"))
 
+    # Analysis retry: how many times a transiently failed job may be re-analyzed
+    MAX_ANALYSIS_ATTEMPTS: int = int(os.getenv("MAX_ANALYSIS_ATTEMPTS", "3"))
+
     # CV generation
     CV_OUTPUT_DIR: str = os.getenv("CV_OUTPUT_DIR", "/tmp/jobfinder_cvs")
 

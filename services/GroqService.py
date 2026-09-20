@@ -6,6 +6,13 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Any
 from core.config import settings
 from models.JobModels import Job
+from services.AnalysisRetry import (
+    TransientAnalysisError,
+    compute_backoff,
+    extract_retry_after,
+    extract_status_code,
+    is_transient_exception,
+)
 
 
 # --- Candidate Profile (REAL data — never fabricated) ---
@@ -262,7 +269,7 @@ class CVContent(BaseModel):
 
 
 class AIService:
-    def __init__(self, api_key: str = settings.GROQ_API_KEY, model: str = settings.GROQ_MODEL):
+    def __init__(self, api_key: str = settings.GROQ_API_KEY, model: str = settings.GROQ_MODEL, sleep=None):
         # Support key rotation: GROQ_API_KEYS (comma-separated) or single GROQ_API_KEY
         self._keys = []
         if settings.GROQ_API_KEYS:
@@ -277,6 +284,7 @@ class AIService:
         # Rate limit tracking per key: {key_index: [timestamps]}
         import time
         self._time = time
+        self._sleep = sleep if sleep is not None else time.sleep
         self._request_times: Dict[int, list] = {i: [] for i in range(len(self._keys))}
         self._MIN_DELAY = 0.5  # Min seconds between requests per key
         self._MAX_RPM_PER_KEY = 28  # Stay under 30 RPM limit
@@ -347,8 +355,11 @@ class AIService:
                 requires_residence_in="",
             )
 
-        max_retries = len(self._keys) * 2  # Try each key up to 2 times
+        max_retries = max(len(self._keys) * 2, 1)  # Try each key up to 2 times
         last_error = None
+        last_transient = False
+        last_retry_after = None
+        last_status_code = None
         
         for attempt in range(max_retries):
             try:
@@ -431,10 +442,29 @@ class AIService:
                 return audit
             except Exception as e:
                 last_error = e
-                logging.getLogger(__name__).warning(f"Groq key #{self._key_index + 1} failed: {e}")
+                last_transient = is_transient_exception(e)
+                last_retry_after = extract_retry_after(e)
+                last_status_code = extract_status_code(e)
+                kind = "transient" if last_transient else "permanent"
+                logging.getLogger(__name__).warning(
+                    f"Groq key #{self._key_index + 1} failed ({kind}): {e}"
+                )
                 if attempt < max_retries - 1:
+                    if last_transient:
+                        # Honor Retry-After when provided; otherwise bounded backoff.
+                        delay = compute_backoff(attempt, last_retry_after)
+                        self._sleep(delay)
                     self._rotate_key()
-        
+
+        # A transient failure must not be turned into a permanent score: signal
+        # the caller so it can persist a retryable row instead of a fake 0/100.
+        if last_transient:
+            raise TransientAnalysisError(
+                f"Transient analysis failure: {str(last_error)[:150]}",
+                status_code=last_status_code,
+                retry_after=last_retry_after,
+            )
+
         return JobAudit(
             match_score=0,
             is_suitable=False,

@@ -19,6 +19,7 @@ from services.RedisServices import MemoryQueue
 from services.CVGenerator import generate_cv, generate_custom_typst, classify_job
 from services.EmailService import EmailService
 from services.LocationPolicy import classify_location, is_notifiable
+from services.AnalysisRetry import TransientAnalysisError, should_reanalyze
 
 # Logging configuration
 logging.basicConfig(
@@ -29,6 +30,23 @@ logger = logging.getLogger(__name__)
 # In-memory store for jobs with emails (for button callbacks)
 # Key: job_id, Value: dict with company, email, cv_path, profile
 jobs_with_email: Dict[str, Dict[str, Any]] = {}
+def _refresh_scraped_fields(target: Job, source: Job) -> Job:
+    """
+    Copy freshly scraped fields onto an existing persisted row (retry path).
+
+    The row is re-analyzed in place because inserting a new object with the same
+    primary key would violate the URL uniqueness constraint. Platform metadata
+    is only overwritten when the new scrape actually provides it.
+    """
+    for field in ("title", "company", "location", "url", "description", "salary",
+                  "is_remote", "source_platform"):
+        setattr(target, field, getattr(source, field))
+    for field in ("seniority", "modality", "tags"):
+        value = getattr(source, field)
+        if value is not None:
+            setattr(target, field, value)
+    return target
+
 
 
 def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardService, email_service: EmailService):
@@ -97,10 +115,17 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
 
     with Session(engine) as session:
         for job in scraped_jobs:
-            # Skip if already exists (deduplication by URL)
+            # Deduplicate by URL. A transiently failed row with attempts left is
+            # re-analyzed in place; healthy or exhausted rows are skipped.
             existing_job = session.get(Job, job.id)
-            if existing_job:
-                continue
+            if existing_job is not None:
+                if not should_reanalyze(
+                    existing_job.analysis_failed,
+                    existing_job.analysis_attempts,
+                    settings.MAX_ANALYSIS_ATTEMPTS,
+                ):
+                    continue
+                job = _refresh_scraped_fields(existing_job, job)
 
             # --- Location policy gate: runs BEFORE any AI call to save tokens ---
             verdict = classify_location(
@@ -132,8 +157,27 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
             logger.info(f"🤖 Analyzing: {job.title} @ {job.company}")
 
             # AI analysis (with rate limiting)
-            audit = ai_service.analyze_job(job, SCORING_PROFILE)
-            
+            try:
+                audit = ai_service.analyze_job(job, SCORING_PROFILE)
+            except TransientAnalysisError as e:
+                # A rate limit / network blip must never be frozen as a 0/100.
+                job.analysis_attempts = (job.analysis_attempts or 0) + 1
+                job.analysis_failed = True
+                if job.analysis_attempts >= settings.MAX_ANALYSIS_ATTEMPTS:
+                    # Exhausted: persist a permanent 0 so it never loops forever.
+                    job.ai_match_score = 0
+                    job.ai_summary = f"Analysis failed after {job.analysis_attempts} attempts"
+                    job.is_suitable = False
+                    job.missing_skills = json.dumps(["Analysis failed: transient error"])
+                logger.warning(
+                    f"⏳ Transient AI failure for {job.title} @ {job.company} "
+                    f"(attempt {job.analysis_attempts}/{settings.MAX_ANALYSIS_ATTEMPTS}, "
+                    f"status={e.status_code or 'n/a'}); not notifying, retrying later."
+                )
+                session.add(job)
+                session.commit()
+                continue
+
             # Small delay between API calls to respect rate limits
             time.sleep(0.5)
 
@@ -158,6 +202,8 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
             job.seniority_mismatch = audit.seniority_mismatch
             job.recommended_profile = audit.recommended_profile
             job.missing_skills = json.dumps(audit.missing_skills) if audit.missing_skills else "[]"
+            job.analysis_failed = False
+
 
             # --- CV Generation for suitable jobs ---
             cv_generated = False

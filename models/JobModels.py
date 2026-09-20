@@ -33,6 +33,9 @@ class Job(SQLModel, table=True):
     is_suitable: Optional[bool] = Field(default=None)
     seniority_mismatch: Optional[bool] = Field(default=None)
     missing_skills: Optional[str] = Field(default=None)  # JSON string list
+    # --- Analysis Retry Bookkeeping ---
+    analysis_attempts: int = Field(default=0)
+    analysis_failed: bool = Field(default=False)
 
     # --- Pipeline Status ---
     cv_generated: bool = Field(default=False)
