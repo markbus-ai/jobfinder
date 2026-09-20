@@ -25,17 +25,19 @@ class JobService:
         limit: int = 15
     ) -> List[Job]:
         """
-        Consume JobSpy y mapea los resultados a nuestro modelo de SQLModel Job.
+        Consume JobSpy and mapea los resultados a nuestro modelo de SQLModel Job.
         """
         try:
             # Llamada a la librería JobSpy (envuelta en retry)
+            # country_indeed drives the Indeed domain and the indeed-co header.
+            # The old country_relevant kwarg was silently swallowed by jobspy.
             jobs_df = self._scrape_safe(
                 site_name=["linkedin", "google", "indeed"],
                 search_term=term,
                 location=location,
                 results_wanted=limit,
                 hours_old=24,
-                country_relevant=country,
+                country_indeed=country,
                 description_format="markdown",
             )
             if jobs_df is None or jobs_df.empty:
