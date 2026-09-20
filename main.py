@@ -14,10 +14,11 @@ from database import engine, create_db_and_tables
 from models.JobModels import Job
 from services.JobServices import JobService
 from services.GetOnBoardService import GetOnBoardService
-from services.GroqService import ai_service
+from services.GroqService import ai_service, SCORING_PROFILE
 from services.RedisServices import MemoryQueue
 from services.CVGenerator import generate_cv, generate_custom_typst, classify_job
 from services.EmailService import EmailService
+from services.LocationPolicy import classify_location, is_notifiable
 
 # Logging configuration
 logging.basicConfig(
@@ -101,10 +102,37 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
             if existing_job:
                 continue
 
+            # --- Location policy gate: runs BEFORE any AI call to save tokens ---
+            verdict = classify_location(
+                location=job.location,
+                is_remote=bool(job.is_remote),
+                modality=job.modality,
+                title=job.title,
+                description=job.description or "",
+                candidate_city=settings.CANDIDATE_CITY,
+                candidate_country=settings.CANDIDATE_COUNTRY,
+                allow_remote=settings.ALLOW_REMOTE,
+                block_foreign_restricted_remote=settings.BLOCK_FOREIGN_RESTRICTED_REMOTE,
+            )
+            job.work_mode = verdict.work_mode
+            job.location_eligible = verdict.eligible
+            job.location_reason = verdict.reason
+
+            if not verdict.eligible:
+                # Persisted for auditability, but it will never be notified and
+                # never reaches the AI/CV/email pipeline.
+                logger.info(
+                    f"⛔ Ineligible location [{verdict.reason}] {job.title} @ {job.company} "
+                    f"| location={job.location!r} | work_mode={verdict.work_mode}"
+                )
+                session.add(job)
+                session.commit()
+                continue
+
             logger.info(f"🤖 Analyzing: {job.title} @ {job.company}")
 
             # AI analysis (with rate limiting)
-            audit = ai_service.analyze_job(job, {})
+            audit = ai_service.analyze_job(job, SCORING_PROFILE)
             
             # Small delay between API calls to respect rate limits
             time.sleep(0.5)
@@ -118,6 +146,10 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                 logger.info(f"   📉 Missing: {', '.join(audit.missing_skills)}")
             if audit.seniority_mismatch:
                 logger.info(f"   ⚠️ Alert: Seniority mismatch")
+            logger.info(
+                f"   🌍 AI location: mode={audit.work_mode} country={audit.job_country or 'n/a'} "
+                f"city={audit.job_city or 'n/a'} residence_required={audit.requires_residence_in or 'none'}"
+            )
 
             # Update model fields from audit
             job.ai_match_score = audit.match_score
@@ -132,7 +164,7 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
             cv_path = None
             company_email = None
 
-            if (job.ai_match_score >= 70 or job.is_suitable):
+            if is_notifiable(job.location_eligible, job.ai_match_score, settings.MIN_MATCH_SCORE):
                 # 1. Generate customized CV content via Groq
                 try:
                     cv_content = ai_service.generate_cv_content(job, audit)
@@ -165,7 +197,7 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                     logger.info(f"   📧 Email found: {company_email}")
 
             # --- Notification ---
-            if (job.ai_match_score >= 70 or job.is_suitable) and not job.notified:
+            if is_notifiable(job.location_eligible, job.ai_match_score, settings.MIN_MATCH_SCORE) and not job.notified:
                 # Mark as notified first
                 job.notified = True
 

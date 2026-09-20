@@ -21,6 +21,11 @@ class Job(SQLModel, table=True):
     tags: Optional[str] = Field(default=None)
     source_platform: Optional[str] = Field(default=None)
 
+    # --- Location Policy Layer ---
+    work_mode: Optional[str] = Field(default=None)  # "remote" | "hybrid" | "onsite" | "unknown"
+    location_eligible: Optional[bool] = Field(default=None)
+    location_reason: Optional[str] = Field(default=None)
+
     # --- AI Analysis Layer ---
     ai_match_score: Optional[int] = Field(default=None)
     ai_summary: Optional[str] = Field(default=None)

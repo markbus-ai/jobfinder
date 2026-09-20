@@ -185,17 +185,69 @@ CANDIDATE_PROFILE = {
     ],
 }
 
+# Compact scoring profile derived verbatim from CANDIDATE_PROFILE.
+# It is sent once per job analysis, so it only keeps what is needed to judge
+# technical fit: identity, location, skills, role summaries, languages, education.
+SCORING_PROFILE = {
+    "name": CANDIDATE_PROFILE["name"],
+    "location": CANDIDATE_PROFILE["location"],
+    "skills": CANDIDATE_PROFILE["skills"],
+    "experience": [
+        {
+            "company": entry["company"],
+            "role": entry["role"],
+            "period": entry["period"],
+            "skills_used": entry["skills_used"],
+        }
+        for entry in CANDIDATE_PROFILE["experience"]
+    ],
+    "languages": CANDIDATE_PROFILE["skills"]["languages"],
+    "education": CANDIDATE_PROFILE["education"],
+}
+
 
 class JobAudit(BaseModel):
     """AI-generated audit of job-candidate fit."""
 
-    match_score: int = Field(description="Score from 0 to 100 of technical compatibility")
-    is_suitable: bool = Field(description="Whether the candidate should apply based on hard data")
+    match_score: int = Field(
+        description=(
+            "Technical overlap score from 0 to 100 between the candidate's real stack and the "
+            "job's required stack. It is NOT a recommendation or interest score. If the candidate "
+            "profile is missing or empty, return 0."
+        )
+    )
+    is_suitable: bool = Field(
+        description=(
+            "True only when the job's required stack genuinely overlaps the candidate's real skills "
+            "AND the candidate lacks no hard requirement (e.g. foreign residence, mandatory "
+            "seniority, mandatory language). It is NOT a discretionary flag and must be false when "
+            "the profile is missing or empty. It never overrides match_score."
+        )
+    )
     missing_skills: List[str] = Field(description="Technologies or requirements the job asks for that the candidate lacks")
     seniority_mismatch: bool = Field(description="True if the job requires significantly more experience than the profile shows")
     short_verdict: str = Field(description="Objective technical justification, max 15 words")
     recommended_profile: str = Field(description="Which CV profile to use: 'backend', 'frontend', or 'backend_ai'")
     key_requirements: List[str] = Field(description="Top 3-5 technical requirements extracted from the job listing")
+    work_mode: str = Field(
+        default="unknown",
+        description="One of: 'remote', 'hybrid', 'onsite', 'unknown'. Infer from the listing text.",
+    )
+    job_country: str = Field(
+        default="",
+        description="Country named by the listing, or empty string when none is stated.",
+    )
+    job_city: str = Field(
+        default="",
+        description="City named by the listing, or empty string when none is stated.",
+    )
+    requires_residence_in: str = Field(
+        default="",
+        description=(
+            "Country or region name the listing explicitly requires the candidate to reside in. "
+            "Must be a plain country/region name only, never free prose. Empty string when none."
+        ),
+    )
 
 
 class CVContent(BaseModel):
@@ -276,6 +328,25 @@ class AIService:
         Uses structured metadata when available to improve analysis accuracy.
         Rotates API keys on failure and respects rate limits.
         """
+        if not cv_data:
+            # Fail closed: never produce a confident score without candidate data.
+            logging.getLogger(__name__).warning(
+                "analyze_job called without candidate profile data; returning zero score."
+            )
+            return JobAudit(
+                match_score=0,
+                is_suitable=False,
+                missing_skills=["No candidate profile data provided"],
+                seniority_mismatch=False,
+                short_verdict="No candidate profile data provided",
+                recommended_profile="backend",
+                key_requirements=[],
+                work_mode="unknown",
+                job_country="",
+                job_city="",
+                requires_residence_in="",
+            )
+
         max_retries = len(self._keys) * 2  # Try each key up to 2 times
         last_error = None
         
@@ -302,8 +373,6 @@ class AIService:
                 if job.source_platform:
                     structured_context += f"\nSource: {job.source_platform}"
 
-                location = settings.CANDIDATE_LOCATION
-
                 audit = self.client.chat.completions.create(
                     model=self.model,
                     response_model=JobAudit,
@@ -316,16 +385,21 @@ class AIService:
                                 "EVALUATION RULES:\n"
                                 "1. Base your analysis solely on facts present in the data. If a skill is not in the JSON, "
                                 "assume the candidate does not have it.\n"
-                                "2. The 'match_score' must be a metric of technical overlap (tech-stack overlap).\n"
+                                "2. The 'match_score' must be a metric of TECHNICAL OVERLAP only (tech-stack "
+                                "overlap). It must be LOW when the candidate profile does not contain the "
+                                "required stack. Never inflate it for location, seniority, or enthusiasm.\n"
                                 "3. Identify 'seniority' discrepancies by comparing years of experience and project "
                                 "responsibility in the CV against job requirements.\n"
                                 "4. Be critical with corporate job language: extract the real technical requirements "
                                 "hidden behind generic descriptions.\n"
                                 "5. The verdict must be a logical conclusion, not a motivational recommendation.\n"
-                                f"6. GEOGRAPHIC PRIORITY CRITICAL: The candidate lives in '{location}'. If the job is "
-                                "on-site or hybrid in this city, INCREASE the 'match_score' by +20 points and consider "
-                                "'is_suitable' as True (unless there is total technical incompatibility), since these "
-                                "jobs are scarce and valuable.\n"
+                                f"6. GEOGRAPHIC ELIGIBILITY (NON-NEGOTIABLE): The candidate lives in Mar del Plata, "
+                                "Argentina. On-site and hybrid roles are acceptable ONLY in Mar del Plata. Remote "
+                                "roles are acceptable UNLESS they require residence in another country (for example "
+                                "'Remote - Spain', 'Remote (Barcelona)', 'must reside in Spain', 'US only'). An "
+                                "on-site or hybrid role in any other city or country is NOT eligible, regardless of "
+                                "technical fit. Never adjust match_score for geography: report the facts in "
+                                "'work_mode', 'job_country', 'job_city', and 'requires_residence_in' instead.\n"
                                 "7. If structured seniority is provided by the platform, use it as the primary "
                                 "reference for evaluating 'seniority_mismatch' — it is more reliable than inferring "
                                 "from the description alone.\n"
@@ -337,7 +411,10 @@ class AIService:
                                 "   - 'backend': for everything else (Python, APIs, databases, DevOps, etc.)\n"
                                 "9. KEY REQUIREMENTS: Extract the top 3-5 specific technical requirements from the job "
                                 "listing. Be precise (e.g., 'FastAPI', 'PostgreSQL', 'React 19') not generic "
-                                "(e.g., 'programming', 'web development')."
+                                "(e.g., 'programming', 'web development').\n"
+                                "10. MISSING DATA: If the candidate profile is missing, empty, or does not allow you "
+                                "to verify the required stack, return match_score = 0 and is_suitable = false. Never "
+                                "guess or default to a confident score."
                             ),
                         },
                         {
