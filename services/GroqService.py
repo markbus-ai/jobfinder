@@ -2,8 +2,8 @@ import json
 import logging
 import instructor
 from groq import Groq
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Dict, Any, Optional
 from core.config import settings
 from models.JobModels import Job
 from services.AnalysisRetry import (
@@ -13,6 +13,7 @@ from services.AnalysisRetry import (
     extract_status_code,
     is_transient_exception,
 )
+from services.EnglishPolicy import ENGLISH_LEVELS, EnglishLevelLiteral, normalize_level
 
 
 # --- Candidate Profile (REAL data — never fabricated) ---
@@ -213,6 +214,44 @@ SCORING_PROFILE = {
 }
 
 
+# Both the response schema and the prompt derive their vocabulary from
+# services.EnglishPolicy.ENGLISH_LEVELS, the single source of truth. Rendering
+# it here keeps the model from ever being told a level the gate does not know.
+_QUOTED_ENGLISH_LEVELS = ", ".join(f"'{level}'" for level in ENGLISH_LEVELS)
+
+# Ordered to match ENGLISH_LEVELS (ascending difficulty) so the meaning of each
+# level stays attached to the right key.
+_ENGLISH_LEVEL_MEANINGS = (
+    "no English needed (listing is fully in Spanish/Portuguese or states no language requirement)",
+    "only reading simple English docs or occasional English terms",
+    "can read/write technical English and join occasional English meetings",
+    "day-to-day spoken English, meetings with English-speaking clients or teams, "
+    "or an explicit 'fluent English required'",
+)
+_ENGLISH_REQUIRED_DESCRIPTION = (
+    "English level the listing requires, judged ONLY from the listing text. One of "
+    + "; ".join(
+        f"'{level}' = {meaning}"
+        for level, meaning in zip(ENGLISH_LEVELS, _ENGLISH_LEVEL_MEANINGS)
+    )
+    + ". Use null when the listing is silent or the level cannot be judged. "
+    "Default to 'intermediate' when the listing says nothing about English; never "
+    "guess 'fluent' without evidence."
+)
+
+# Rule 11 of the analysis system prompt. The default sentence is load-bearing:
+# without it the model guesses 'fluent' more often, which the gate then withholds.
+ENGLISH_LEVEL_PROMPT = (
+    "11. ENGLISH LEVEL: Judge 'english_required' from the listing text only, using the "
+    f"closed vocabulary {_QUOTED_ENGLISH_LEVELS}. Use 'fluent' only with "
+    "explicit evidence such as meetings with English-speaking clients/teams, "
+    "'fluent English required', or the whole listing being in English. 'English is a plus' "
+    "is at most 'intermediate'. When the listing says nothing about English, default to "
+    "'intermediate' rather than guessing 'fluent'. Quote the justifying text in "
+    "'english_evidence', or leave it empty when the listing says nothing."
+)
+
+
 class JobAudit(BaseModel):
     """AI-generated audit of job-candidate fit."""
 
@@ -255,20 +294,9 @@ class JobAudit(BaseModel):
             "Must be a plain country/region name only, never free prose. Empty string when none."
         ),
     )
-    english_required: str = Field(
-        default="intermediate",
-        description=(
-            "English level the listing requires, judged ONLY from the listing text. One of: "
-            "'none' = no English needed (listing is fully in Spanish/Portuguese or states no "
-            "language requirement); "
-            "'basic' = only reading simple English docs or occasional English terms; "
-            "'intermediate' = can read/write technical English and join occasional English "
-            "meetings; "
-            "'fluent' = day-to-day spoken English, meetings with English-speaking clients or "
-            "teams, or an explicit 'fluent English required'. "
-            "Default to 'intermediate' when the listing says nothing about English; never guess "
-            "'fluent' without evidence."
-        ),
+    english_required: Optional[EnglishLevelLiteral] = Field(
+        default=None,
+        description=_ENGLISH_REQUIRED_DESCRIPTION,
     )
     english_evidence: str = Field(
         default="",
@@ -278,6 +306,20 @@ class JobAudit(BaseModel):
             "listing says nothing about English."
         ),
     )
+
+    @field_validator("english_required", mode="before")
+    @classmethod
+    def _coerce_english_required(cls, value: object) -> Optional[str]:
+        """
+        Map anything outside the closed vocabulary to ``None``.
+
+        The model is asked for a fixed vocabulary, but a non-compliant answer
+        ('C1', 'fluent English', a stray number) must neither crash the analysis
+        nor slip past the gate. Normalizing to ``None`` keeps the failure closed
+        and auditable: ``english_allowed(None, ...)`` withholds the row.
+        """
+        normalized = normalize_level(value)
+        return None if normalized is None else normalized.value
 
 
 class CVContent(BaseModel):
@@ -376,7 +418,7 @@ class AIService:
                 job_country="",
                 job_city="",
                 requires_residence_in="",
-                english_required="intermediate",
+                english_required=None,
                 english_evidence="",
             )
 
@@ -451,13 +493,7 @@ class AIService:
                                 "10. MISSING DATA: If the candidate profile is missing, empty, or does not allow you "
                                 "to verify the required stack, return match_score = 0 and is_suitable = false. Never "
                                 "guess or default to a confident score.\n"
-                                "11. ENGLISH LEVEL: Judge 'english_required' from the listing text only, using the "
-                                "closed vocabulary 'none', 'basic', 'intermediate', 'fluent'. Use 'fluent' only with "
-                                "explicit evidence such as meetings with English-speaking clients/teams, "
-                                "'fluent English required', or the whole listing being in English. 'English is a plus' "
-                                "is at most 'intermediate'. When the listing says nothing about English, default to "
-                                "'intermediate' rather than guessing 'fluent'. Quote the justifying text in "
-                                "'english_evidence', or leave it empty when the listing says nothing."
+                                f"{ENGLISH_LEVEL_PROMPT}"
                             ),
                         },
                         {
@@ -505,7 +541,7 @@ class AIService:
             short_verdict=f"Error técnico: {str(last_error)[:50]}",
             recommended_profile="backend",
             key_requirements=[],
-            english_required="intermediate",
+            english_required=None,
             english_evidence="",
         )
 
@@ -514,7 +550,7 @@ class AIService:
         Generate customized CV content for a specific job using Groq.
         Rotates API keys on failure and respects rate limits.
         """
-        max_retries = len(self._keys) * 2  # Try each key up to 2 times
+        max_retries = max(len(self._keys) * 2, 1)  # Try each key up to 2 times
         last_error = None
         
         for attempt in range(max_retries):

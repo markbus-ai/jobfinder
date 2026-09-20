@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -16,11 +16,16 @@ from services.JobServices import JobService
 from services.GetOnBoardService import GetOnBoardService
 from services.GroqService import ai_service, SCORING_PROFILE
 from services.RedisServices import MemoryQueue
-from services.CVGenerator import generate_cv, generate_custom_typst, classify_job
+from services.CVGenerator import generate_cv, generate_custom_typst
 from services.EmailService import EmailService
 from services.LocationPolicy import classify_location, is_notifiable
 from services.AnalysisRetry import TransientAnalysisError, should_reanalyze
-from services.EnglishPolicy import english_allowed
+from services.EnglishPolicy import (
+    ENGLISH_LEVELS,
+    english_allowed,
+    is_notifiable_with_stored_english,
+    normalize_level,
+)
 from services.SearchPlanner import build_scrape_plan, parse_csv, summarize_plan
 
 # Logging configuration
@@ -33,13 +38,10 @@ logger = logging.getLogger(__name__)
 # Key: job_id, Value: dict with company, email, cv_path, profile
 jobs_with_email: Dict[str, Dict[str, Any]] = {}
 
-# Display labels for the English level shown in the Telegram notification.
-ENGLISH_LEVEL_LABELS = {
-    "none": "No requerido",
-    "basic": "Básico",
-    "intermediate": "Intermedio",
-    "fluent": "Fluido",
-}
+# Telegram display labels for the English level, keyed from the single-source
+# vocabulary so a level can never be added without a label.
+_ENGLISH_LEVEL_DISPLAY = ("No requerido", "Básico", "Intermedio", "Fluido")
+ENGLISH_LEVEL_LABELS = dict(zip(ENGLISH_LEVELS, _ENGLISH_LEVEL_DISPLAY))
 
 
 def _refresh_scraped_fields(target: Job, source: Job) -> Job:
@@ -59,6 +61,77 @@ def _refresh_scraped_fields(target: Job, source: Job) -> Job:
             setattr(target, field, value)
     return target
 
+
+def _notification_payload(
+    job: Job,
+    *,
+    cv_generated: bool,
+    cv_path: Optional[str],
+    company_email: Optional[str],
+) -> Dict[str, Any]:
+    """Build the message payload the Telegram worker consumes from a Job row."""
+    return {
+        "id": job.id,
+        "title": job.title,
+        "company": job.company,
+        "location": job.location,
+        "match_score": job.ai_match_score,
+        "summary": job.ai_summary,
+        "url": job.url,
+        "missing_skills": json.loads(job.missing_skills) if job.missing_skills else [],
+        "seniority_mismatch": job.seniority_mismatch,
+        "is_suitable": job.is_suitable,
+        "english_required": job.english_required,
+        "recommended_profile": job.recommended_profile,
+        "cv_generated": cv_generated,
+        "cv_path": cv_path,
+        "company_email": company_email,
+    }
+
+
+def _release_english_withheld(
+    job: Job,
+    session: Session,
+    notifications: list[Dict[str, Any]],
+) -> bool:
+    """
+    Notify a stored row that was withheld only by the English ceiling.
+
+    This is deliberately TOKEN-FREE: it decides from persisted values and never
+    calls the AI, so raising MAX_ENGLISH_LEVEL is retroactive at zero cost. Do
+    not "optimize" it back into a re-analysis -- that would spend one Groq
+    request per previously-withheld row, which is exactly what this path avoids.
+
+    Returns True when the row was released.
+    """
+    if not is_notifiable_with_stored_english(
+        location_eligible=job.location_eligible,
+        match_score=job.ai_match_score,
+        notified=job.notified,
+        analysis_failed=job.analysis_failed,
+        english_required=job.english_required,
+        min_match_score=settings.MIN_MATCH_SCORE,
+        max_english_level=settings.MAX_ENGLISH_LEVEL,
+    ):
+        return False
+
+    job.notified = True
+    notifications.append(
+        _notification_payload(
+            job,
+            cv_generated=bool(job.cv_generated),
+            cv_path=job.cv_path,
+            company_email=None,
+        )
+    )
+    session.add(job)
+    session.commit()
+    logger.info(
+        f"Released previously withheld job {job.title} @ {job.company}: stored "
+        f"English level '{job.english_required}' now fits "
+        f"MAX_ENGLISH_LEVEL='{settings.MAX_ENGLISH_LEVEL}' (no AI call)."
+    )
+    return True
 
 
 def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardService, email_service: EmailService):
@@ -151,6 +224,10 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                     existing_job.analysis_attempts,
                     settings.MAX_ANALYSIS_ATTEMPTS,
                 ):
+                    # A stored row skipped by dedup may still be releasable if
+                    # MAX_ENGLISH_LEVEL was raised after it was withheld. That
+                    # check is token-free (stored values only), never a re-analysis.
+                    _release_english_withheld(existing_job, session, notifications)
                     continue
                 job = _refresh_scraped_fields(existing_job, job)
 
@@ -234,6 +311,7 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
             job.recommended_profile = audit.recommended_profile
             job.missing_skills = json.dumps(audit.missing_skills) if audit.missing_skills else "[]"
             job.english_required = audit.english_required
+            job.english_evidence = audit.english_evidence
             job.analysis_failed = False
 
             # Notification gate: location + score + English ceiling. The English
@@ -243,10 +321,16 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                 job.location_eligible, job.ai_match_score, settings.MIN_MATCH_SCORE
             ) and english_allowed(job.english_required, settings.MAX_ENGLISH_LEVEL)
             if not notifiable and job.ai_match_score is not None and job.ai_match_score >= settings.MIN_MATCH_SCORE:
-                logger.info(
-                    f"   Withheld: English level '{job.english_required}' exceeds "
-                    f"MAX_ENGLISH_LEVEL='{settings.MAX_ENGLISH_LEVEL}'."
-                )
+                if normalize_level(job.english_required) is None:
+                    logger.info(
+                        f"   Withheld: English level missing or outside the closed "
+                        f"vocabulary (english_required={job.english_required!r}); failing closed."
+                    )
+                else:
+                    logger.info(
+                        f"   Withheld: English level '{job.english_required}' exceeds "
+                        f"MAX_ENGLISH_LEVEL='{settings.MAX_ENGLISH_LEVEL}'."
+                    )
 
             # --- CV Generation for suitable jobs ---
             cv_generated = False
@@ -299,23 +383,14 @@ def process_jobs_sync(job_service: JobService, getonboard_service: GetOnBoardSer
                         "profile": audit.recommended_profile,
                     }
 
-                notifications.append({
-                    "id": job.id,
-                    "title": job.title,
-                    "company": job.company,
-                    "location": job.location,
-                    "match_score": job.ai_match_score,
-                    "summary": job.ai_summary,
-                    "url": job.url,
-                    "missing_skills": json.loads(job.missing_skills) if job.missing_skills else [],
-                    "seniority_mismatch": job.seniority_mismatch,
-                    "is_suitable": job.is_suitable,
-                    "english_required": job.english_required,
-                    "recommended_profile": audit.recommended_profile,
-                    "cv_generated": cv_generated,
-                    "cv_path": cv_path,
-                    "company_email": company_email,
-                })
+                notifications.append(
+                    _notification_payload(
+                        job,
+                        cv_generated=cv_generated,
+                        cv_path=cv_path,
+                        company_email=company_email,
+                    )
+                )
 
             # Single commit per job — save all state at once
             session.add(job)
